@@ -868,7 +868,7 @@ async function sweepStation({ station, devices, deviceBySerial, state }) {
     let maxEnd = stState.watermarkMs ?? 0;
     for (const r of candidates) if (r.endMs > maxEnd) maxEnd = r.endMs;
     if (maxEnd > untilMs + 5 * 60_000) maxEnd = untilMs + 5 * 60_000; // clock-skew clamp
-    if (stState.watermarkMs === null || maxEnd > stState.watermarkMs) stState.watermarkMs = maxEnd;
+    if (maxEnd > (stState.watermarkMs ?? 0)) stState.watermarkMs = maxEnd;
     for (const r of newRecords) {
         const id = String(r.recordId);
         if (!stState.seenRecordIds.map(String).includes(id)) stState.seenRecordIds.push(r.recordId);
@@ -877,7 +877,7 @@ async function sweepStation({ station, devices, deviceBySerial, state }) {
         stState.seenRecordIds = stState.seenRecordIds.slice(-MAX_SEEN_IDS);
     }
     saveState(state);
-    log(`${name}: state advanced (watermark=${new Date(stState.watermarkMs).toISOString()}, seen=${stState.seenRecordIds.length})`);
+    log(`${name}: state saved (watermark=${stState.watermarkMs === null ? "none" : new Date(stState.watermarkMs).toISOString()}, seen=${stState.seenRecordIds.length})`);
 
     return { ok: true, newCount: newRecords.length, thumbs, clips };
 }
