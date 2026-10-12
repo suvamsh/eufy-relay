@@ -1,0 +1,92 @@
+name: relay
+
+# Eufy event relay sweep: every 15 minutes (+ manual dispatch).
+# Restores the stored guest session, pulls new event bundles from the
+# cameras' on-device databases over P2P, and pushes them to the private
+# data repo (suvamsh/eufy-relay-data) over SSH with a write deploy key.
+# This repo contains code + workflow only: no secrets, no session data,
+# no state, no camera media.
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: eufy-sweep
+  cancel-in-progress: false
+
+permissions:
+  contents: read # the data-repo push goes over SSH (deploy key), not this token
+
+jobs:
+  sweep:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: vendor/eufy-security-client/package-lock.json
+
+      - name: Materialize stored session (secret, never printed)
+        env:
+          EUFY_PERSISTENT_JSON: ${{ secrets.EUFY_PERSISTENT_JSON }}
+        run: |
+          umask 077
+          mkdir -p app/persistent-data
+          printf '%s' "$EUFY_PERSISTENT_JSON" > app/persistent-data/persistent.json
+
+      - name: Checkout data repo (SSH deploy key)
+        uses: actions/checkout@v4
+        with:
+          repository: suvamsh/eufy-relay-data
+          ssh-key: ${{ secrets.DATA_DEPLOY_KEY }}
+          path: data
+
+      - name: Install vendored client dependencies
+        working-directory: vendor/eufy-security-client
+        run: npm ci --no-audit --no-fund
+
+      - name: Run sweep
+        env:
+          EUFY_USERNAME: ${{ secrets.EUFY_USERNAME }}
+          RELAY_DATA_DIR: ${{ github.workspace }}/data
+        run: |
+          set -o pipefail
+          node app/sweep.mjs 2>&1 | tee sweep.log
+
+      - name: Upload sweep log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sweep-log
+          path: sweep.log
+          if-no-files-found: warn
+
+      - name: Commit + push data repo (only if anything changed)
+        if: success()
+        env:
+          DATA_DEPLOY_KEY: ${{ secrets.DATA_DEPLOY_KEY }}
+        run: |
+          umask 077
+          mkdir -p ~/.ssh
+          printf '%s\n' "$DATA_DEPLOY_KEY" > ~/.ssh/data_deploy_key
+          chmod 600 ~/.ssh/data_deploy_key
+          export GIT_SSH_COMMAND="ssh -i ~/.ssh/data_deploy_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
+          cd data
+          git config user.name "eufy-relay"
+          git config user.email "eufy-relay@localhost"
+          if [ -z "$(git status --porcelain)" ]; then
+            echo "relay-data: no changes to commit"
+            exit 0
+          fi
+          git add -A
+          git commit -m "sweep $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          git push origin HEAD
+          echo "relay-data: pushed $(git rev-parse --short HEAD)"
