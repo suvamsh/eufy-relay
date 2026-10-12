@@ -8,9 +8,13 @@
  *      client's session-reuse patch accepts the stored session as-is).
  *   2. For each station (staggered, in STATION_ORDER): connects over P2P
  *      (one retry after a 20 s settle), queries the station's on-device event
- *      database (databaseQueryByDate, per device-local day) from that
- *      station's watermark in the data repo's state.json to now, and for
- *      every NEW record downloads the thumbnail (always) and the clip
+ *      database (databaseQueryLocal over the device-local days spanning the
+ *      window — the fetch path the reference device-history module uses;
+ *      databaseQueryByDate was live-proven in run 38322895407 to never
+ *      answer on any station while count/latest-info on the same channel
+ *      respond) from that station's watermark in the data repo's state.json
+ *      to now, and for every NEW record downloads the thumbnail (always)
+ *      and the clip
  *      (person-flagged records, or Backyard / Sideyard / Living Room /
  *      Front Door devices; clips are capped at 60 MB).
  *   3. Writes one bundle per new record into the data repo checkout:
@@ -246,7 +250,7 @@ class StationChannel {
     }
 
     wire() {
-        for (const eventName of ["station database count by date", "station database query by date"]) {
+        for (const eventName of ["station database count by date", "station database query local"]) {
             this.client.on(eventName, (station, returnCode, data) => {
                 if (station?.getSerial?.() !== this.serial) return;
                 const pending = this.pendingCollects.get(eventName);
@@ -388,25 +392,23 @@ class StationChannel {
         );
     }
 
-    async queryByDate(serials, firstDay, lastDay) {
+    async queryLocal(serials, firstDay, lastDay) {
+        const res = await this.withRetry("query local", () =>
+            this.collect(
+                "station database query local",
+                () => this.station.databaseQueryLocal(serials, firstDay, lastDay, 0, 0, 0),
+                QUERY_TIMEOUT_MS,
+                QUERY_SETTLE_MS,
+            ),
+        );
         const merged = [];
         const seen = new Set();
-        for (let d = firstDay.getTime(); d <= lastDay.getTime(); d += 24 * 3600_000) {
-            const day = new Date(d);
-            const res = await this.withRetry(`query ${day.toISOString().slice(0, 10)}`, () =>
-                this.collect(
-                    "station database query by date",
-                    () => this.station.databaseQueryByDate(serials, day, day, 0, 0, 0),
-                    QUERY_TIMEOUT_MS,
-                    QUERY_SETTLE_MS,
-                ),
-            );
-            for (const r of res.records ?? []) {
-                const key = `${r.record_id}|${r.device_sn}|${r.start_time?.getTime?.() ?? r.start_time}`;
-                if (!seen.has(key)) {
-                    seen.add(key);
-                    merged.push(r);
-                }
+        for (const r of res.records ?? []) {
+            const h = r.history ?? {};
+            const key = `${r.record_id}|${r.device_sn}|${h.start_time?.getTime?.() ?? h.start_time}`;
+            if (!seen.has(key)) {
+                seen.add(key);
+                merged.push(r);
             }
         }
         return merged;
@@ -526,6 +528,25 @@ class StationChannel {
             return await attempt();
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// person classification (mirrors device-history.mjs classifyDbRecord)
+// ---------------------------------------------------------------------------
+const HUMAN_DETECTION_TYPE_BY_MODEL = [
+    [/^T8170/, 3],
+    [/^T8416/, 1],
+    [/^T8530/, 2],
+    [/^T8021/, 2],
+];
+function classifyPictures(pictures, model) {
+    const detectionTypes = [...new Set(pictures.map((p) => p.detectionType).filter((v) => typeof v === "number"))];
+    let personFlagged = pictures.some((p) => (p.personId ?? 0) > 0 || p.personRecogFlag === true);
+    if (!personFlagged && model) {
+        const entry = HUMAN_DETECTION_TYPE_BY_MODEL.find(([re]) => re.test(model));
+        if (entry && detectionTypes.includes(entry[1])) personFlagged = true;
+    }
+    return { personFlagged, detectionTypes, hasCrops: pictures.length > 0 };
 }
 
 // ---------------------------------------------------------------------------
@@ -715,36 +736,46 @@ async function sweepStation({ station, devices, deviceBySerial, state }) {
     // ---- query --------------------------------------------------------------
     let rawRecords;
     try {
-        rawRecords = await channel.queryByDate(serials, firstDay, lastDay);
+        rawRecords = await channel.queryLocal(serials, firstDay, lastDay);
     } catch (e) {
         return { ok: false, reason: `database query failed: ${shortErr(e)}` };
     }
     log(`${name}: query returned ${rawRecords.length} records`);
 
-    // normalize + window filter
+    // normalize + window filter (QueryLocal shape: item.history + item.picture)
     const records = [];
     for (const r of rawRecords) {
-        const startMs = deviceTimeMs(r.start_time);
-        const endMs = deviceTimeMs(r.end_time) ?? startMs;
+        const h = r.history ?? {};
+        const startMs = deviceTimeMs(h.start_time);
+        const endMs = deviceTimeMs(h.end_time) ?? startMs;
         if (startMs === null || endMs === null) continue;
         const deviceObj = r.device_sn ? deviceBySerial.get(r.device_sn) : undefined;
         const deviceName = deviceObj?.getName() ?? (serials.length === 1 ? stDevices[0].getName() : null);
-        const personFlagged = r.trigger_type === 4 || PERSON_VIDEO_TYPES.has(r.video_type);
+        const deviceModel = deviceObj?.getModel() ?? null;
+        const pictures = (r.picture ?? []).map((p) => ({
+            detectionType: p.detection_type ?? null,
+            personId: p.person_id ?? 0,
+            personRecogFlag: p.person_recog_flag ?? false,
+        }));
+        const cls = classifyPictures(pictures, deviceModel);
+        const personFlagged = cls.personFlagged || h.trigger_type === 4 || PERSON_VIDEO_TYPES.has(h.video_type);
         records.push({
             recordId: r.record_id ?? `t${startMs}-${deviceName ?? "unknown"}`,
             deviceSn: r.device_sn ?? null,
             deviceName,
-            deviceModel: deviceObj?.getModel() ?? null,
+            deviceModel,
             startMs,
             endMs,
-            storagePath: r.storage_path || null,
-            thumbPath: r.thumb_path || null,
-            cipherId: r.cipher_id ?? null,
-            folderSize: typeof r.folder_size === "number" ? r.folder_size : null,
-            frameNum: r.frame_num ?? null,
-            triggerType: r.trigger_type ?? null,
-            videoType: r.video_type ?? null,
-            storageCloud: r.storage_cloud ?? null,
+            storagePath: h.storage_path || null,
+            thumbPath: h.thumb_path || null,
+            cipherId: h.cipher_id ?? null,
+            folderSize: typeof h.folder_size === "number" ? h.folder_size : null,
+            frameNum: h.frame_num ?? null,
+            triggerType: h.trigger_type ?? null,
+            videoType: h.video_type ?? null,
+            storageCloud: h.storage_cloud ?? null,
+            detectionTypes: cls.detectionTypes,
+            hasCrops: cls.hasCrops,
             personFlagged,
         });
     }
@@ -777,6 +808,8 @@ async function sweepStation({ station, devices, deviceBySerial, state }) {
             videoType: rec.videoType,
             videoName: VIDEO_NAMES[rec.videoType] ?? null,
             personFlagged: rec.personFlagged,
+            detectionTypes: rec.detectionTypes,
+            hasCrops: rec.hasCrops,
             folderSize: rec.folderSize,
             frameNum: rec.frameNum,
             storageCloud: rec.storageCloud,
