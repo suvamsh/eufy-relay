@@ -7,38 +7,45 @@
  *      attempted here — no password exists in this environment; the vendored
  *      client's session-reuse patch accepts the stored session as-is).
  *   2. For each station (staggered, in STATION_ORDER): connects over P2P
- *      (one retry after a 20 s settle), queries the station's on-device event
- *      database (databaseQueryLocal over the device-local days spanning the
- *      window — the fetch path the reference device-history module uses;
- *      databaseQueryByDate was live-proven in run 38322895407 to never
- *      answer on any station while count/latest-info on the same channel
- *      respond) from that station's watermark in the data repo's state.json
- *      to now, and for every NEW record downloads the thumbnail (always)
- *      and the clip
- *      (person-flagged records, or Backyard / Sideyard / Living Room /
- *      Front Door devices; clips are capped at 60 MB).
- *   3. Writes one bundle per new record into the data repo checkout:
- *      inbox/<stationSlug>-<recordId>/{record.json, thumb.*, clip.mp4}.
- *   4. Advances a station's watermark + seen record IDs in state.json ONLY
- *      after that station's bundles are fully written. A station that fails
- *      keeps its old watermark; the sweep continues with the next station.
+ *      (one retry after a 20 s settle), then asks the station for its
+ *      latest-event info (databaseQueryLatestInfo): per device, the total
+ *      event count and the on-device path of the newest event's snapshot.
+ *   3. For every device whose snapshot path changed since the last sweep,
+ *      downloads that snapshot (downloadImage) and writes one bundle into
+ *      the data repo checkout: inbox/<station>-<device>-<yyyymmddhhmmss>/
+ *      {record.json, thumb.*}. A station's state advances ONLY after its
+ *      bundles are fully written; a failed station keeps its old state and
+ *      the sweep continues with the next station.
  *
- * Hardening (from the probe's Porch count timeout): every DB operation
- * (count, query, downloads) gets ONE retry; on a timeout the retry is
- * preceded by a databaseQueryLatestInfo warm-up call that re-proves the
- * station's DB channel.
+ * WHY LATEST-INFO AND NOT THE EVENT-DATABASE QUERIES (firmware reality,
+ * live-proven Oct 12-13, 2026 — runs 38322895407 / 38324139181, diags
+ * 38324474756 / 38325670602; same behaviour reported upstream for this
+ * client version in bropat/eufy-security-client issue #963, owner + LAN):
+ *   - databaseQueryByDate: never answers on any station (and drops the
+ *     P2P connection in the upstream report).
+ *   - databaseQueryLocal: answers returnCode 0 with ZERO records on every
+ *     station, even where databaseCountByDate reports dozens of records.
+ *   - databaseCountByDate + databaseQueryLatestInfo DO answer, and
+ *     downloadImage on the latest-info snapshot path delivers a real JPEG
+ *     (verified: 21,505 bytes from the Front Door, JPEG magic confirmed).
+ * Consequences, by design: each sweep delivers the NEWEST event snapshot
+ * per device (plus the event-count delta, so events that arrived between
+ * sweeps are counted even though only the newest is fetchable), and clips
+ * are not available through this path on current firmware.
  *
- * Time handling mirrors harness/pull-p2p-24h.mjs: the client parses device
- * timestamps as runner-local (UTC in Actions), so a parsed Date's UTC
- * components ARE the device wall time (America/Los_Angeles); they are
- * reinterpreted as such to obtain true epoch instants.
+ * Battery discipline: one latest-info round per station per sweep (the
+ * client also auto-queries latest-info on connect). Timeouts get ONE
+ * retry — battery cameras routinely answer only on the second ask.
+ *
+ * Event times come from the snapshot filename (a 14-digit device-local
+ * timestamp, America/Los_Angeles), converted to true epoch instants with
+ * the same reinterpretation helpers as harness/pull-p2p-24h.mjs.
  *
  * Logs never contain station/device serials or session material: stations
  * and devices are referred to by name only.
  */
 import fs from "node:fs";
 import path from "node:path";
-import { Writable } from "node:stream";
 import { fileURLToPath } from "node:url";
 
 const USERNAME = process.env.EUFY_USERNAME || "";
@@ -55,27 +62,14 @@ const INBOX_DIR = path.join(DATA_DIR, "inbox");
 const DEVICE_TZ = "America/Los_Angeles";
 
 const STATION_ORDER = ["WifiBridge", "Porch", "Backyard", "Sideyard", "Living Room"];
-const CLIP_DEVICE_NAMES = new Set(["Backyard", "Sideyard", "Living Room", "Front Door"]);
-const FIRST_WINDOW_MS = 24 * 3600_000; // first run per station: last 24 h
-const MAX_WINDOW_MS = 7 * 24 * 3600_000; // never query further back than 7 d
-const MAX_CLIP_BYTES = 60 * 1024 * 1024; // skip clips larger than 60 MB
-const MAX_SEEN_IDS = 500; // per station, most recent kept
 const GLOBAL_STATION_BUDGET_MS = 20 * 60_000; // abort NEW station work after 20 min
 const HARD_WATCHDOG_MS = 28 * 60_000;
 const CONNECT_TIMEOUT_MS = 90_000;
 const CONNECT_SETTLE_MS = 20_000;
-const COUNT_TIMEOUT_MS = 35_000;
-const QUERY_TIMEOUT_MS = 50_000;
-const QUERY_SETTLE_MS = 4_000;
-const WARMUP_TIMEOUT_MS = 15_000;
+const LATEST_TIMEOUT_MS = 45_000;
+const LATEST_SETTLE_MS = 10_000;
 const IMAGE_TIMEOUT_MS = 30_000;
-const CLIP_START_TIMEOUT_MS = 30_000;
-const CLIP_TOTAL_TIMEOUT_MS = 150_000;
 const STATION_GAP_MS = 5_000;
-
-const TRIGGER_NAMES = { 0: "MOTION1", 1: "MOTION2", 2: "MOTION3", 4: "PERSON", 8: "RING", 16: "SENSOR", 32: "UNKNOWN", 64: "MISSED_RING", 128: "ANSWER_RING" };
-const VIDEO_NAMES = { 1000: "RECEIVED_RING", 1001: "MISSED_RING", 1002: "MOTION", 1003: "PERSON", 1004: "PET", 1005: "CRYING", 1006: "SOUND", 65536: "PUTDOWN_PACKAGE", 131072: "TAKE_PACKAGE", 262144: "DETECT_PACKAGE", 524288: "RECEIVED_RING_ACK", 1048576: "RECEIVED_RING_MISS", 2097152: "RECEIVED_CAR_GUARD" };
-const PERSON_VIDEO_TYPES = new Set([1003, 65536, 131072, 262144]);
 
 const t0 = Date.now();
 const stamp = () => `+${((Date.now() - t0) / 1000).toFixed(1)}s`;
@@ -91,7 +85,6 @@ const slugify = (name) =>
         .toLowerCase()
         .replace(/[^a-z0-9]+/g, "-")
         .replace(/^-+|-+$/g, "") || "station";
-const sanitizeId = (id) => String(id ?? "unknown").replace(/[^A-Za-z0-9_-]+/g, "_");
 
 // ---------------------------------------------------------------------------
 // timezone helpers (mirrors pull-p2p-24h.mjs)
@@ -112,27 +105,23 @@ function tzOffsetMs(timeZone, utcMs) {
     const asUtc = Date.UTC(+parts.year, +parts.month - 1, +parts.day, +parts.hour === 24 ? 0 : +parts.hour, +parts.minute, +parts.second);
     return asUtc - Math.floor(utcMs / 1000) * 1000;
 }
-/** Parsed client Date -> true epoch ms, treating UTC components as device wall time. */
-function deviceTimeMs(parsed) {
-    if (!(parsed instanceof Date) || Number.isNaN(parsed.getTime())) return null;
-    const guess = Date.UTC(parsed.getUTCFullYear(), parsed.getUTCMonth(), parsed.getUTCDate(), parsed.getUTCHours(), parsed.getUTCMinutes(), parsed.getUTCSeconds());
+/** Device-local wall time (from a snapshot path's 14-digit stamp) -> epoch ms. */
+function wallStampToMs(digits) {
+    const y = +digits.slice(0, 4);
+    const mo = +digits.slice(4, 6);
+    const d = +digits.slice(6, 8);
+    const h = +digits.slice(8, 10);
+    const mi = +digits.slice(10, 12);
+    const s = +digits.slice(12, 14);
+    const guess = Date.UTC(y, mo - 1, d, h, mi, s);
     let utc = guess - tzOffsetMs(DEVICE_TZ, guess);
     utc = guess - tzOffsetMs(DEVICE_TZ, utc); // refine once
     return utc;
 }
-/** Device-local calendar days (as UTC-midnight Dates) spanning [sinceMs, untilMs]. */
-function deviceLocalDays(sinceMs, untilMs) {
-    const dtf = new Intl.DateTimeFormat("en-US", { timeZone: DEVICE_TZ, year: "numeric", month: "2-digit", day: "2-digit" });
-    const dayOf = (ms) => {
-        const parts = {};
-        for (const p of dtf.formatToParts(new Date(ms))) parts[p.type] = p.value;
-        return Date.UTC(+parts.year, +parts.month - 1, +parts.day);
-    };
-    const first = dayOf(sinceMs);
-    const last = dayOf(untilMs);
-    const days = [];
-    for (let d = first; d <= last && days.length < 9; d += 24 * 3600_000) days.push(new Date(d));
-    return days;
+/** First 14-digit timestamp embedded in an on-device snapshot path. */
+function parsePathStamp(p) {
+    const m = String(p ?? "").match(/(\d{14})/);
+    return m ? m[1] : null;
 }
 const fmtLocal = (ms) => {
     const dtf = new Intl.DateTimeFormat("en-US", {
@@ -170,6 +159,8 @@ function expiryToMs(value) {
 
 // ---------------------------------------------------------------------------
 // state (data repo: state.json)
+//   { stations: { [stationName]: { watermarkMs, devices: {
+//       [deviceName]: { cropPath, eventCount } } } } }
 // ---------------------------------------------------------------------------
 function loadState() {
     try {
@@ -188,11 +179,12 @@ function saveState(state) {
     fs.renameSync(tmp, STATE_FILE);
 }
 function stationState(state, name) {
-    state.stations[name] ??= { watermarkMs: null, seenRecordIds: [] };
-    const st = state.stations[name];
-    if (!Array.isArray(st.seenRecordIds)) st.seenRecordIds = [];
-    if (st.watermarkMs !== null && typeof st.watermarkMs !== "number") st.watermarkMs = null;
-    return st;
+    const raw = state.stations[name] ?? {};
+    state.stations[name] = {
+        watermarkMs: typeof raw.watermarkMs === "number" && raw.watermarkMs > 0 ? raw.watermarkMs : null,
+        devices: raw.devices && typeof raw.devices === "object" ? raw.devices : {},
+    };
+    return state.stations[name];
 }
 
 // ---------------------------------------------------------------------------
@@ -234,8 +226,8 @@ function ensureP2PConnected(station, timeoutMs = CONNECT_TIMEOUT_MS) {
 }
 
 // ---------------------------------------------------------------------------
-// per-station DB channel: pending-map correlation over client events,
-// with warm-up + single retry on timeouts (probe hardening)
+// per-station channel: latest-info + image download over client events,
+// one retry on timeouts (battery cameras often answer only the second ask)
 // ---------------------------------------------------------------------------
 class StationChannel {
     constructor(client, station) {
@@ -243,28 +235,16 @@ class StationChannel {
         this.station = station;
         this.serial = station.getSerial();
         this.name = station.getName();
-        this.pendingCollects = new Map(); // eventName -> {batches, returnCode, resolve, reject, timer, settleTimer, settleMs}
+        this.pendingLatest = null; // {resolve, reject, timer}
         this.pendingImages = new Map(); // filePath -> {resolve, reject, timer}
-        this.pendingDownloads = new Map(); // deviceSerial -> {...}
-        this.wire();
-    }
-
-    wire() {
-        for (const eventName of ["station database count by date", "station database query local"]) {
-            this.client.on(eventName, (station, returnCode, data) => {
-                if (station?.getSerial?.() !== this.serial) return;
-                const pending = this.pendingCollects.get(eventName);
-                if (!pending) return;
-                if (returnCode !== 0 && pending.batches.length === 0) {
-                    this.settleCollect(eventName, new Error(`database command returned code ${returnCode}`));
-                    return;
-                }
-                pending.returnCode = returnCode;
-                if (Array.isArray(data)) pending.batches.push(...data);
-                if (pending.settleTimer) clearTimeout(pending.settleTimer);
-                pending.settleTimer = setTimeout(() => this.settleCollect(eventName, null), pending.settleMs);
-            });
-        }
+        this.client.on("station database query latest", (station, returnCode, data) => {
+            if (station?.getSerial?.() !== this.serial || !this.pendingLatest) return;
+            const pending = this.pendingLatest;
+            this.pendingLatest = null;
+            clearTimeout(pending.timer);
+            if (returnCode !== 0) pending.reject(new Error(`latest-info returned code ${returnCode}`));
+            else pending.resolve(Array.isArray(data) ? data : []);
+        });
         this.client.on("station image download", (station, file, image) => {
             const pending = this.pendingImages.get(file);
             if (!pending) return;
@@ -272,281 +252,75 @@ class StationChannel {
             clearTimeout(pending.timer);
             pending.resolve(image);
         });
-        this.client.on("station download start", (station, device, metadata, videoStream, audioStream) => {
-            const serial = device?.getSerial?.();
-            const pending = serial ? this.pendingDownloads.get(serial) : undefined;
-            if (audioStream) audioStream.pipe(new Writable({ write(_c, _e, cb) { cb(); } })); // always drain audio
-            if (!pending) {
-                videoStream?.resume();
-                return;
-            }
-            pending.started = true;
-            pending.videoStream = videoStream;
-            videoStream.on("data", (chunk) => {
-                pending.bytes += chunk.length;
-                if (pending.bytes > MAX_CLIP_BYTES && !pending.oversize) {
-                    pending.oversize = true;
-                    void this.client.cancelStationDownload(serial).catch(() => {});
-                    this.failDownload(serial, new Error(`clip exceeds ${MAX_CLIP_BYTES} bytes — download aborted (skip)`));
-                }
-            });
-            videoStream.on("error", (err) => this.failDownload(serial, err));
-            videoStream.pipe(pending.fileStream);
-        });
-        this.client.on("station download finish", (station, device) => {
-            const serial = device?.getSerial?.();
-            const pending = serial ? this.pendingDownloads.get(serial) : undefined;
-            if (!pending) return;
-            this.pendingDownloads.delete(serial);
-            clearTimeout(pending.timer);
-            pending.fileStream.end(() => {
-                try {
-                    fs.renameSync(pending.tmpPath, pending.finalPath);
-                } catch {
-                    pending.finalPath = pending.tmpPath;
-                }
-                pending.resolve({ file: path.basename(pending.finalPath), bytes: pending.bytes });
-            });
-        });
     }
 
-    settleCollect(eventName, err) {
-        const pending = this.pendingCollects.get(eventName);
-        if (!pending) return;
-        this.pendingCollects.delete(eventName);
-        clearTimeout(pending.timer);
-        if (pending.settleTimer) clearTimeout(pending.settleTimer);
-        if (err) pending.reject(err);
-        else pending.resolve({ returnCode: pending.returnCode, records: pending.batches });
-    }
-
-    /** Accumulating collect for one DB command; send() issues the command. */
-    collect(eventName, send, timeoutMs, settleMs) {
-        if (this.pendingCollects.has(eventName)) {
-            return Promise.reject(new Error(`a "${eventName}" collect is already outstanding for ${this.name}`));
-        }
-        return new Promise((resolve, reject) => {
+    async latestInfoOnce() {
+        if (this.pendingLatest) throw new Error("a latest-info request is already outstanding");
+        const p = new Promise((resolve, reject) => {
             const timer = setTimeout(() => {
-                const pending = this.pendingCollects.get(eventName);
-                if (pending && (pending.batches.length > 0 || pending.returnCode !== null)) {
-                    this.settleCollect(eventName, null); // partial data beats a timeout
-                } else {
-                    this.settleCollect(eventName, new Error(`timeout after ${timeoutMs}ms waiting for "${eventName}"`));
-                }
-            }, timeoutMs);
-            this.pendingCollects.set(eventName, { batches: [], returnCode: null, resolve, reject, timer, settleTimer: null, settleMs });
-            try {
-                send();
-            } catch (e) {
-                this.settleCollect(eventName, e instanceof Error ? e : new Error(String(e)));
-            }
+                this.pendingLatest = null;
+                reject(new Error(`timeout after ${LATEST_TIMEOUT_MS}ms waiting for latest-info`));
+            }, LATEST_TIMEOUT_MS);
+            this.pendingLatest = { resolve, reject, timer };
         });
-    }
-
-    /** Latest-info warm-up: re-proves the station's DB channel. Never throws. */
-    async warmup() {
         try {
-            const p = new Promise((resolve) => {
-                const timer = setTimeout(() => {
-                    this.client.off("station database query latest", handler);
-                    resolve(false);
-                }, WARMUP_TIMEOUT_MS);
-                const handler = (station, _rc, _data) => {
-                    if (station?.getSerial?.() !== this.serial) return;
-                    clearTimeout(timer);
-                    this.client.off("station database query latest", handler);
-                    resolve(true);
-                };
-                this.client.on("station database query latest", handler);
-            });
             this.station.databaseQueryLatestInfo();
-            const ok = await p;
-            log(`  ${this.name}: warm-up latest-info ${ok ? "answered" : "no answer"}`);
-            return ok;
         } catch (e) {
-            log(`  ${this.name}: warm-up failed (${shortErr(e)})`);
-            return false;
-        }
-    }
-
-    /** Run fn(); on timeout, warm up and retry exactly once. */
-    async withRetry(label, fn) {
-        try {
-            return await fn();
-        } catch (e) {
-            if (!isTimeoutErr(e)) throw e;
-            log(`  ${this.name}: ${label} timed out — warm-up + one retry`);
-            await this.warmup();
-            return await fn();
-        }
-    }
-
-    async countByDate(firstDay, lastDay) {
-        return this.withRetry("count", () =>
-            this.collect(
-                "station database count by date",
-                () => this.station.databaseCountByDate(firstDay, lastDay),
-                COUNT_TIMEOUT_MS,
-                2_000,
-            ),
-        );
-    }
-
-    async queryLocal(serials, firstDay, lastDay) {
-        const res = await this.withRetry("query local", () =>
-            this.collect(
-                "station database query local",
-                () => this.station.databaseQueryLocal(serials, firstDay, lastDay, 0, 0, 0),
-                QUERY_TIMEOUT_MS,
-                QUERY_SETTLE_MS,
-            ),
-        );
-        const merged = [];
-        const seen = new Set();
-        for (const r of res.records ?? []) {
-            const h = r.history ?? {};
-            const key = `${r.record_id}|${r.device_sn}|${h.start_time?.getTime?.() ?? h.start_time}`;
-            if (!seen.has(key)) {
-                seen.add(key);
-                merged.push(r);
+            if (this.pendingLatest) {
+                clearTimeout(this.pendingLatest.timer);
+                this.pendingLatest = null;
             }
+            throw e;
         }
-        return merged;
+        return p;
     }
 
-    async downloadThumbnail(record) {
-        if (!record.thumbPath) throw new Error("record has no thumb_path");
-        const attempt = async () => {
-            if (this.pendingImages.has(record.thumbPath)) throw new Error("thumbnail download already outstanding");
-            const p = new Promise((resolve, reject) => {
-                const timer = setTimeout(() => {
-                    this.pendingImages.delete(record.thumbPath);
-                    reject(new Error(`timeout after ${IMAGE_TIMEOUT_MS}ms waiting for thumbnail`));
-                }, IMAGE_TIMEOUT_MS);
-                this.pendingImages.set(record.thumbPath, { resolve, reject, timer });
-            });
-            try {
-                this.station.downloadImage(record.thumbPath);
-            } catch (e) {
-                const pending = this.pendingImages.get(record.thumbPath);
-                if (pending) {
-                    this.pendingImages.delete(record.thumbPath);
-                    clearTimeout(pending.timer);
-                }
-                throw e;
-            }
-            const image = await p;
-            const buf = Buffer.isBuffer(image) ? image : image?.data ? Buffer.from(image.data) : null;
-            if (!buf || buf.length === 0) throw new Error("thumbnail download returned no image data");
-            return buf;
-        };
+    async latestInfo() {
         try {
-            return await attempt();
+            return await this.latestInfoOnce();
         } catch (e) {
             if (!isTimeoutErr(e)) throw e;
-            log(`  ${this.name}: thumbnail timed out — warm-up + one retry`);
-            await this.warmup();
-            return await attempt();
+            log(`  ${this.name}: latest-info timed out — settle ${LATEST_SETTLE_MS / 1000}s, one retry`);
+            await sleep(LATEST_SETTLE_MS);
+            return await this.latestInfoOnce();
         }
     }
 
-    failDownload(serial, err) {
-        const pending = this.pendingDownloads.get(serial);
-        if (!pending) return;
-        this.pendingDownloads.delete(serial);
-        clearTimeout(pending.timer);
+    async downloadImageOnce(filePath) {
+        if (this.pendingImages.has(filePath)) throw new Error("an image download is already outstanding for this path");
+        const p = new Promise((resolve, reject) => {
+            const timer = setTimeout(() => {
+                this.pendingImages.delete(filePath);
+                reject(new Error(`timeout after ${IMAGE_TIMEOUT_MS}ms waiting for image download`));
+            }, IMAGE_TIMEOUT_MS);
+            this.pendingImages.set(filePath, { resolve, reject, timer });
+        });
         try {
-            pending.fileStream.destroy();
-        } catch {
-            /* ignore */
-        }
-        try {
-            fs.unlinkSync(pending.tmpPath);
-        } catch {
-            /* ignore */
-        }
-        pending.reject(err instanceof Error ? err : new Error(String(err)));
-    }
-
-    async downloadClip(record, bundleDir) {
-        if (!record.storagePath) throw new Error("record has no storage_path");
-        if (!record.deviceSn) throw new Error("record has no device serial");
-        const serial = record.deviceSn;
-        const attempt = async () => {
-            if (this.pendingDownloads.has(serial)) throw new Error("a clip download is already outstanding for this device");
-            const finalPath = path.join(bundleDir, "clip.mp4");
-            const tmpPath = `${finalPath}.part`;
-            const fileStream = fs.createWriteStream(tmpPath);
-            const done = new Promise((resolve, reject) => {
-                const timer = setTimeout(() => {
-                    void this.client.cancelStationDownload(serial).catch(() => {});
-                    this.failDownload(serial, new Error(`timeout after ${CLIP_TOTAL_TIMEOUT_MS}ms downloading clip`));
-                }, CLIP_TOTAL_TIMEOUT_MS);
-                this.pendingDownloads.set(serial, {
-                    resolve,
-                    reject,
-                    timer,
-                    fileStream,
-                    tmpPath,
-                    finalPath,
-                    bytes: 0,
-                    started: false,
-                    oversize: false,
-                });
-            });
-            // start-timeout guard: if no "download start" arrives, fail fast
-            const startDeadline = setTimeout(() => {
-                const pending = this.pendingDownloads.get(serial);
-                if (pending && !pending.started) {
-                    void this.client.cancelStationDownload(serial).catch(() => {});
-                    this.failDownload(serial, new Error(`timeout after ${CLIP_START_TIMEOUT_MS}ms waiting for clip download to start`));
-                }
-            }, CLIP_START_TIMEOUT_MS);
-            startDeadline.unref?.();
-            try {
-                await this.client.startStationDownload(serial, record.storagePath, record.cipherId ?? 0);
-            } catch (e) {
-                clearTimeout(startDeadline);
-                this.failDownload(serial, e instanceof Error ? e : new Error(String(e)));
-            }
-            try {
-                return await done;
-            } finally {
-                clearTimeout(startDeadline);
-            }
-        };
-        try {
-            return await attempt();
+            this.station.downloadImage(filePath);
         } catch (e) {
-            // Retry once only when nothing was transferred (a stalled start is
-            // the battery-sleep failure mode); a mid-transfer failure or an
-            // oversize skip is final.
-            const pendingGone = !this.pendingDownloads.has(serial);
-            if (!pendingGone || /exceeds/.test(e.message)) throw e;
-            log(`  ${this.name}: clip download failed before transfer (${shortErr(e)}) — warm-up + one retry`);
-            await this.warmup();
-            return await attempt();
+            const pending = this.pendingImages.get(filePath);
+            if (pending) {
+                this.pendingImages.delete(filePath);
+                clearTimeout(pending.timer);
+            }
+            throw e;
+        }
+        const image = await p;
+        const buf = Buffer.isBuffer(image) ? image : image?.data ? Buffer.from(image.data) : null;
+        if (!buf || buf.length === 0) throw new Error("image download returned no data");
+        return buf;
+    }
+
+    async downloadImage(filePath) {
+        try {
+            return await this.downloadImageOnce(filePath);
+        } catch (e) {
+            if (!isTimeoutErr(e)) throw e;
+            log(`  ${this.name}: image download timed out — one retry`);
+            await sleep(3_000);
+            return await this.downloadImageOnce(filePath);
         }
     }
-}
-
-// ---------------------------------------------------------------------------
-// person classification (mirrors device-history.mjs classifyDbRecord)
-// ---------------------------------------------------------------------------
-const HUMAN_DETECTION_TYPE_BY_MODEL = [
-    [/^T8170/, 3],
-    [/^T8416/, 1],
-    [/^T8530/, 2],
-    [/^T8021/, 2],
-];
-function classifyPictures(pictures, model) {
-    const detectionTypes = [...new Set(pictures.map((p) => p.detectionType).filter((v) => typeof v === "number"))];
-    let personFlagged = pictures.some((p) => (p.personId ?? 0) > 0 || p.personRecogFlag === true);
-    if (!personFlagged && model) {
-        const entry = HUMAN_DETECTION_TYPE_BY_MODEL.find(([re]) => re.test(model));
-        if (entry && detectionTypes.includes(entry[1])) personFlagged = true;
-    }
-    return { personFlagged, detectionTypes, hasCrops: pictures.length > 0 };
 }
 
 // ---------------------------------------------------------------------------
@@ -649,7 +423,6 @@ async function main() {
     const state = loadState();
     fs.mkdirSync(INBOX_DIR, { recursive: true });
 
-    // station processing order: STATION_ORDER first, extras appended
     const ordered = [
         ...STATION_ORDER.map((n) => stations.find((s) => s.getName() === n)).filter(Boolean),
         ...stations.filter((s) => !STATION_ORDER.includes(s.getName())),
@@ -661,7 +434,7 @@ async function main() {
             log(`SWEEP station=${name} SKIP time budget (20 min) reached — remaining stations deferred to next run`);
             continue;
         }
-        const result = await sweepStation({ station, devices, deviceBySerial, state }).catch((e) => ({
+        const result = await sweepStation({ station, state, deviceBySerial }).catch((e) => ({
             ok: false,
             reason: shortErr(e),
         }));
@@ -687,22 +460,9 @@ async function main() {
     process.exit(0);
 }
 
-async function sweepStation({ station, devices, deviceBySerial, state }) {
+async function sweepStation({ station, state, deviceBySerial }) {
     const name = station.getName();
-    const serial = station.getSerial();
     const stState = stationState(state, name);
-    const nowMs = Date.now();
-    let sinceMs = stState.watermarkMs ?? nowMs - FIRST_WINDOW_MS;
-    if (nowMs - sinceMs > MAX_WINDOW_MS) {
-        log(`${name}: watermark is older than 7 d — clamping window start`);
-        sinceMs = nowMs - MAX_WINDOW_MS;
-    }
-    const untilMs = nowMs;
-    log(`${name}: window ${new Date(sinceMs).toISOString()} -> ${new Date(untilMs).toISOString()} (watermark ${stState.watermarkMs === null ? "none (first run)" : new Date(stState.watermarkMs).toISOString()}, seen=${stState.seenRecordIds.length})`);
-
-    const stDevices = devices.filter((d) => d.getStationSerial() === serial);
-    const serials = stDevices.map((d) => d.getSerial());
-    if (serials.length === 0) return { ok: false, reason: "no devices known for this station" };
 
     // ---- connect (one retry after a 20 s settle) ---------------------------
     let conn = await ensureP2PConnected(station, CONNECT_TIMEOUT_MS);
@@ -719,114 +479,92 @@ async function sweepStation({ station, devices, deviceBySerial, state }) {
     }
     log(`${name}: P2P connected`);
 
+    // ---- latest-event info ---------------------------------------------------
     const channel = new StationChannel(client, station);
-    const days = deviceLocalDays(sinceMs, untilMs);
-    const firstDay = days[0];
-    const lastDay = days[days.length - 1];
-
-    // ---- count (informational cross-check; hardened with warm-up+retry) ---
+    let latest;
     try {
-        const c = await channel.countByDate(firstDay, lastDay);
-        const total = (c.records ?? []).reduce((acc, r) => acc + (typeof r.count === "number" ? r.count : 0), 0);
-        log(`${name}: db count for window days = ${total}`);
+        latest = await channel.latestInfo();
     } catch (e) {
-        log(`${name}: count failed after retry (${shortErr(e)}) — proceeding to query`);
+        return { ok: false, reason: `latest-info failed: ${shortErr(e)}` };
     }
+    log(`${name}: latest-info answered for ${latest.length} device(s)`);
 
-    // ---- query --------------------------------------------------------------
-    let rawRecords;
-    try {
-        rawRecords = await channel.queryLocal(serials, firstDay, lastDay);
-    } catch (e) {
-        return { ok: false, reason: `database query failed: ${shortErr(e)}` };
-    }
-    log(`${name}: query returned ${rawRecords.length} records`);
-
-    // normalize + window filter (QueryLocal shape: item.history + item.picture)
-    const records = [];
-    for (const r of rawRecords) {
-        const h = r.history ?? {};
-        const startMs = deviceTimeMs(h.start_time);
-        const endMs = deviceTimeMs(h.end_time) ?? startMs;
-        if (startMs === null || endMs === null) continue;
-        const deviceObj = r.device_sn ? deviceBySerial.get(r.device_sn) : undefined;
-        const deviceName = deviceObj?.getName() ?? (serials.length === 1 ? stDevices[0].getName() : null);
-        const deviceModel = deviceObj?.getModel() ?? null;
-        const pictures = (r.picture ?? []).map((p) => ({
-            detectionType: p.detection_type ?? null,
-            personId: p.person_id ?? 0,
-            personRecogFlag: p.person_recog_flag ?? false,
-        }));
-        const cls = classifyPictures(pictures, deviceModel);
-        const personFlagged = cls.personFlagged || h.trigger_type === 4 || PERSON_VIDEO_TYPES.has(h.video_type);
-        records.push({
-            recordId: r.record_id ?? `t${startMs}-${deviceName ?? "unknown"}`,
-            deviceSn: r.device_sn ?? null,
-            deviceName,
-            deviceModel,
-            startMs,
-            endMs,
-            storagePath: h.storage_path || null,
-            thumbPath: h.thumb_path || null,
-            cipherId: h.cipher_id ?? null,
-            folderSize: typeof h.folder_size === "number" ? h.folder_size : null,
-            frameNum: h.frame_num ?? null,
-            triggerType: h.trigger_type ?? null,
-            videoType: h.video_type ?? null,
-            storageCloud: h.storage_cloud ?? null,
-            detectionTypes: cls.detectionTypes,
-            hasCrops: cls.hasCrops,
-            personFlagged,
-        });
-    }
-    records.sort((a, b) => a.startMs - b.startMs);
-    const candidates = records.filter((r) => r.endMs > sinceMs && r.startMs <= untilMs + 60_000);
-    const seenSet = new Set(stState.seenRecordIds.map(String));
-    const newRecords = candidates.filter((r) => !seenSet.has(String(r.recordId)));
-    log(`${name}: ${candidates.length} in window, ${newRecords.length} new`);
-
-    // ---- bundles ------------------------------------------------------------
+    let newCount = 0;
     let thumbs = 0;
-    let clips = 0;
-    for (const rec of newRecords) {
-        const bundleDir = path.join(INBOX_DIR, `${slugify(name)}-${sanitizeId(rec.recordId)}`);
-        fs.mkdirSync(bundleDir, { recursive: true });
-        const bundle = {
-            recordId: rec.recordId,
-            station: name,
-            device: rec.deviceName,
-            model: rec.deviceModel,
-            startUtc: new Date(rec.startMs).toISOString(),
-            endUtc: new Date(rec.endMs).toISOString(),
-            startMs: rec.startMs,
-            endMs: rec.endMs,
-            startLocal: fmtLocal(rec.startMs),
-            endLocal: fmtLocal(rec.endMs),
-            durationSec: Math.max(0, Math.round((rec.endMs - rec.startMs) / 1000)),
-            triggerType: rec.triggerType,
-            triggerName: TRIGGER_NAMES[rec.triggerType] ?? null,
-            videoType: rec.videoType,
-            videoName: VIDEO_NAMES[rec.videoType] ?? null,
-            personFlagged: rec.personFlagged,
-            detectionTypes: rec.detectionTypes,
-            hasCrops: rec.hasCrops,
-            folderSize: rec.folderSize,
-            frameNum: rec.frameNum,
-            storageCloud: rec.storageCloud,
-            thumbFile: null,
-            thumbBytes: null,
-            thumbError: null,
-            clipFile: null,
-            clipBytes: null,
-            clipError: null,
-            clipSkipped: null,
-            sweptAt: new Date().toISOString(),
-        };
+    let dirty = false;
+    let maxEventMs = stState.watermarkMs ?? 0;
 
-        // thumbnail — always attempted
-        if (rec.thumbPath) {
+    for (const entry of latest) {
+        const deviceObj = entry.device_sn ? deviceBySerial.get(entry.device_sn) : undefined;
+        const deviceName = deviceObj?.getName() ?? null;
+        if (!deviceName) {
+            log(`${name}: latest-info entry for an unknown device — skipped`);
+            continue;
+        }
+        const cropPath = entry.crop_local_path || entry.crop_cloud_path || null;
+        const eventCount = typeof entry.event_count === "number" ? entry.event_count : null;
+        const storedDev = stState.devices[deviceName] ?? null;
+        if (!cropPath) {
+            log(`${name}: ${deviceName}: no snapshot path in latest-info (event_count=${eventCount})`);
+            continue;
+        }
+        if (storedDev?.cropPath === cropPath) {
+            if (storedDev.eventCount !== eventCount) {
+                storedDev.eventCount = eventCount;
+                dirty = true;
+            }
+            log(`${name}: ${deviceName}: no new event (event_count=${eventCount})`);
+            continue;
+        }
+
+        // ---- new latest event for this device --------------------------------
+        const digits = parsePathStamp(cropPath);
+        const eventMs = digits ? wallStampToMs(digits) : null;
+        const countDelta = storedDev && eventCount !== null && typeof storedDev.eventCount === "number" ? eventCount - storedDev.eventCount : null;
+        log(
+            `${name}: ${deviceName}: NEW event ${digits ? fmtLocal(eventMs) : "(unstamped path)"} ` +
+                `(event_count=${eventCount}${countDelta !== null ? `, delta=${countDelta}` : ""})`,
+        );
+        const bundleName = `${slugify(name)}-${slugify(deviceName)}-${digits ?? `count${eventCount ?? "x"}`}`;
+        const bundleDir = path.join(INBOX_DIR, bundleName);
+
+        if (fs.existsSync(path.join(bundleDir, "record.json"))) {
+            // Already delivered by an earlier run whose state write was lost.
+            log(`${name}: ${deviceName}: bundle ${bundleName} already in inbox — marking seen without re-download`);
+        } else {
+            fs.mkdirSync(bundleDir, { recursive: true });
+            const bundle = {
+                recordId: bundleName,
+                station: name,
+                device: deviceName,
+                model: deviceObj?.getModel() ?? null,
+                source: "latest-info",
+                startUtc: eventMs !== null ? new Date(eventMs).toISOString() : null,
+                endUtc: eventMs !== null ? new Date(eventMs).toISOString() : null,
+                startMs: eventMs,
+                endMs: eventMs,
+                startLocal: eventMs !== null ? fmtLocal(eventMs) : null,
+                endLocal: eventMs !== null ? fmtLocal(eventMs) : null,
+                durationSec: null,
+                triggerType: null,
+                triggerName: null,
+                videoType: null,
+                videoName: null,
+                personFlagged: null, // latest-info carries no classification; GG judges the snapshot
+                eventCount,
+                countDelta,
+                thumbFile: null,
+                thumbBytes: null,
+                thumbError: null,
+                clipFile: null,
+                clipBytes: null,
+                clipError: null,
+                clipSkipped:
+                    "clips are not reachable on current firmware: the event-database row queries return nothing (see RELAY-BUILD.md); only the newest event snapshot per device is exposed",
+                sweptAt: new Date().toISOString(),
+            };
             try {
-                const buf = await channel.downloadThumbnail(rec);
+                const buf = await channel.downloadImage(cropPath);
                 const file = `thumb${sniffImage(buf)}`;
                 fs.writeFileSync(path.join(bundleDir, file), buf);
                 bundle.thumbFile = file;
@@ -834,52 +572,27 @@ async function sweepStation({ station, devices, deviceBySerial, state }) {
                 thumbs++;
             } catch (e) {
                 bundle.thumbError = shortErr(e);
-                log(`${name}: thumbnail failed for record ${rec.recordId}: ${shortErr(e)}`);
+                log(`${name}: ${deviceName}: snapshot download failed: ${shortErr(e)}`);
             }
-        } else {
-            bundle.thumbError = "record carries no thumb_path";
+            // record.json last: a bundle dir containing record.json is complete
+            fs.writeFileSync(path.join(bundleDir, "record.json"), JSON.stringify(bundle, null, 2));
+            newCount++;
         }
 
-        // clip — person-flagged, or an always-clip device
-        const wantClip = rec.personFlagged || (rec.deviceName !== null && CLIP_DEVICE_NAMES.has(rec.deviceName));
-        if (!wantClip) {
-            bundle.clipSkipped = "not person-flagged and device not in always-clip set";
-        } else if (!rec.storagePath) {
-            bundle.clipError = "record carries no storage_path";
-        } else if (rec.folderSize !== null && rec.folderSize > MAX_CLIP_BYTES) {
-            bundle.clipSkipped = `folder_size ${rec.folderSize} exceeds ${MAX_CLIP_BYTES} bytes`;
-        } else {
-            try {
-                const got = await channel.downloadClip(rec, bundleDir);
-                bundle.clipFile = got.file;
-                bundle.clipBytes = got.bytes;
-                clips++;
-            } catch (e) {
-                bundle.clipError = shortErr(e);
-                log(`${name}: clip failed for record ${rec.recordId}: ${shortErr(e)}`);
-            }
-        }
-
-        // record.json last: a bundle dir containing record.json is complete
-        fs.writeFileSync(path.join(bundleDir, "record.json"), JSON.stringify(bundle, null, 2));
+        // state for this device advances only now (bundle fully written)
+        stState.devices[deviceName] = { cropPath, eventCount };
+        dirty = true;
+        if (eventMs !== null && eventMs > maxEventMs) maxEventMs = eventMs;
     }
 
-    // ---- state advance (only now: every bundle for this station is written)
-    let maxEnd = stState.watermarkMs ?? 0;
-    for (const r of candidates) if (r.endMs > maxEnd) maxEnd = r.endMs;
-    if (maxEnd > untilMs + 5 * 60_000) maxEnd = untilMs + 5 * 60_000; // clock-skew clamp
-    if (maxEnd > (stState.watermarkMs ?? 0)) stState.watermarkMs = maxEnd;
-    for (const r of newRecords) {
-        const id = String(r.recordId);
-        if (!stState.seenRecordIds.map(String).includes(id)) stState.seenRecordIds.push(r.recordId);
+    if (maxEventMs > (stState.watermarkMs ?? 0)) stState.watermarkMs = maxEventMs;
+    if (dirty) {
+        saveState(state);
+        log(`${name}: state saved (watermark=${stState.watermarkMs === null ? "none" : new Date(stState.watermarkMs).toISOString()})`);
+    } else {
+        log(`${name}: no changes`);
     }
-    if (stState.seenRecordIds.length > MAX_SEEN_IDS) {
-        stState.seenRecordIds = stState.seenRecordIds.slice(-MAX_SEEN_IDS);
-    }
-    saveState(state);
-    log(`${name}: state saved (watermark=${stState.watermarkMs === null ? "none" : new Date(stState.watermarkMs).toISOString()}, seen=${stState.seenRecordIds.length})`);
-
-    return { ok: true, newCount: newRecords.length, thumbs, clips };
+    return { ok: true, newCount, thumbs, clips: 0 };
 }
 
 main().catch((e) => {
