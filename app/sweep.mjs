@@ -37,6 +37,21 @@
  * client also auto-queries latest-info on connect). Timeouts get ONE
  * retry — battery cameras routinely answer only on the second ask.
  *
+ * V3 — BOUNDED PATH ENUMERATION (Experiment L, run 38358594501): the
+ * SoloCam/indoor snapshot path is a pure function of the event's
+ * device-local second —
+ *   /media/mmcblk0p1/Camera00/event/<YYYYMM>/<YYYYMMDD>/<stamp>_snapshot.jpg
+ * — and downloadImage answers a CONSTRUCTED path for a past event in
+ * 0.13–0.8 s (byte-identical JPEGs), while a nonexistent path gets
+ * silence (no error). So when a device's event-count delta says events
+ * arrived that the newest-only v2 step did not deliver, the sweep probes
+ * the seconds between the stored snapshot and the newest one, ascending,
+ * and bundles every snapshot it finds. Probing is hard-bounded (see the
+ * ENUM_* constants) and resumable: per-device progress lives in state
+ * (enumCursorStamp / enumPendingMissing), so a bounded-out sweep resumes
+ * the same window on the next run instead of rescanning or skipping.
+ * The Front Door's /video/<stamp>_c00.jpg scheme is NOT enumerated.
+ *
  * Event times come from the snapshot filename (a 14-digit device-local
  * timestamp, America/Los_Angeles), converted to true epoch instants with
  * the same reinterpretation helpers as harness/pull-p2p-24h.mjs.
@@ -47,6 +62,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { parseEnumTemplate, buildEnumPath, shiftStamp } from "./enum-paths.mjs";
 
 const USERNAME = process.env.EUFY_USERNAME || "";
 const COUNTRY = "US";
@@ -70,6 +86,11 @@ const LATEST_TIMEOUT_MS = 45_000;
 const LATEST_SETTLE_MS = 10_000;
 const IMAGE_TIMEOUT_MS = 30_000;
 const STATION_GAP_MS = 5_000;
+// sweep v3 enumeration bounds (battery + run-budget protection)
+const ENUM_PROBE_TIMEOUT_MS = 2_500; // exp-l: hits answer in <=0.8 s; a miss is silence — cap it short
+const ENUM_CONCURRENCY = 6; // probes in flight per station session
+const ENUM_MAX_PROBES_PER_DEVICE = 1_500; // hard probe budget per device per sweep
+const ENUM_STATION_BUDGET_MS = 8 * 60_000; // hard enumeration budget per station per sweep
 
 const t0 = Date.now();
 const stamp = () => `+${((Date.now() - t0) / 1000).toFixed(1)}s`;
@@ -160,7 +181,11 @@ function expiryToMs(value) {
 // ---------------------------------------------------------------------------
 // state (data repo: state.json)
 //   { stations: { [stationName]: { watermarkMs, devices: {
-//       [deviceName]: { cropPath, eventCount } } } } }
+//       [deviceName]: { cropPath, eventCount,
+//                       enumCursorStamp?, enumPendingMissing? } } } } }
+//   enumCursorStamp (v3): newest stamp whose window position is fully
+//   scanned-or-captured; enumPendingMissing (v3): snapshots still owed in
+//   the open window (cursor, newest]. Both absent on pre-v3 state.
 // ---------------------------------------------------------------------------
 function loadState() {
     try {
@@ -321,6 +346,40 @@ class StationChannel {
             return await this.downloadImageOnce(filePath);
         }
     }
+
+    /**
+     * v3 enumeration probe: like downloadImageOnce but with a short,
+     * caller-chosen timeout and NO retry — a nonexistent path is answered
+     * with silence, so the timeout IS the miss signal. The pending entry
+     * is keyed by path in the same map as normal downloads, so concurrent
+     * probes resolve independently, and a timeout removes its own entry
+     * (a late delivery for a timed-out path finds no entry and is
+     * dropped) — a miss can never wedge the map.
+     */
+    async probeImage(filePath, timeoutMs = ENUM_PROBE_TIMEOUT_MS) {
+        if (this.pendingImages.has(filePath)) throw new Error("an image download is already outstanding for this path");
+        const p = new Promise((resolve, reject) => {
+            const timer = setTimeout(() => {
+                this.pendingImages.delete(filePath);
+                reject(new Error(`probe timeout after ${timeoutMs}ms waiting for image`));
+            }, timeoutMs);
+            this.pendingImages.set(filePath, { resolve, reject, timer });
+        });
+        try {
+            this.station.downloadImage(filePath);
+        } catch (e) {
+            const pending = this.pendingImages.get(filePath);
+            if (pending) {
+                this.pendingImages.delete(filePath);
+                clearTimeout(pending.timer);
+            }
+            throw e;
+        }
+        const image = await p;
+        const buf = Buffer.isBuffer(image) ? image : image?.data ? Buffer.from(image.data) : null;
+        if (!buf || buf.length === 0) throw new Error("image download returned no data");
+        return buf;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -460,6 +519,183 @@ async function main() {
     process.exit(0);
 }
 
+// ---------------------------------------------------------------------------
+// sweep v3: bounded enumeration of missed event snapshots for one device.
+// Scans the device-local seconds (cursor, newestStamp) ascending, in
+// batches of ENUM_CONCURRENCY probes (ENUM_PROBE_TIMEOUT_MS miss cap —
+// nonexistent paths are answered with silence), bundling every hit until
+// `owed` snapshots are found, the window is exhausted, or a hard bound
+// (per-device probe cap / per-station enumeration budget / global sweep
+// budget) is hit. Progress persists into state after every batch via
+// devState (enumCursorStamp / enumPendingMissing), so a bounded-out sweep
+// resumes the same window next run instead of rescanning or skipping.
+// ---------------------------------------------------------------------------
+async function enumerateMissing({ channel, stationName, deviceName, deviceObj, template, devState, newestStamp, owed, state, enumDeadline }) {
+    const tStart = Date.now();
+    const startCursor = devState.enumCursorStamp;
+    let probed = 0;
+    let found = 0;
+    let bundles = 0;
+    let thumbsAdded = 0;
+    let maxEventMs = 0;
+    let cursor = startCursor;
+    let stamp = shiftStamp(cursor, 1);
+    let windowClosed = false;
+    let aborted = false;
+
+    const deliver = (bs, buf) => {
+        found++;
+        const bundleName = `${slugify(stationName)}-${slugify(deviceName)}-${bs}`;
+        const bundleDir = path.join(INBOX_DIR, bundleName);
+        if (fs.existsSync(path.join(bundleDir, "record.json"))) return; // delivered by an earlier run
+        fs.mkdirSync(bundleDir, { recursive: true });
+        const eventMs = wallStampToMs(bs);
+        const bundle = {
+            recordId: bundleName,
+            station: stationName,
+            device: deviceName,
+            model: deviceObj?.getModel() ?? null,
+            source: "enumerated",
+            startUtc: new Date(eventMs).toISOString(),
+            endUtc: new Date(eventMs).toISOString(),
+            startMs: eventMs,
+            endMs: eventMs,
+            startLocal: fmtLocal(eventMs),
+            endLocal: fmtLocal(eventMs),
+            durationSec: null,
+            triggerType: null,
+            triggerName: null,
+            videoType: null,
+            videoName: null,
+            personFlagged: null, // enumeration carries no classification; GG judges the snapshot
+            eventCount: null, // per-event counts are not exposed; the gap came from the device delta
+            countDelta: null,
+            thumbFile: null,
+            thumbBytes: null,
+            thumbError: null,
+            clipFile: null,
+            clipBytes: null,
+            clipError: null,
+            clipSkipped:
+                "clips are not reachable on current firmware: the event-database row queries return nothing (see RELAY-BUILD.md); snapshots are recovered by bounded path enumeration (sweep v3)",
+            sweptAt: new Date().toISOString(),
+        };
+        const file = `thumb${sniffImage(buf)}`;
+        fs.writeFileSync(path.join(bundleDir, file), buf);
+        bundle.thumbFile = file;
+        bundle.thumbBytes = buf.length;
+        // record.json last: a bundle dir containing record.json is complete
+        fs.writeFileSync(path.join(bundleDir, "record.json"), JSON.stringify(bundle, null, 2));
+        bundles++;
+        thumbsAdded++;
+        if (eventMs > maxEventMs) maxEventMs = eventMs;
+    };
+
+    const persist = () => {
+        devState.enumCursorStamp = cursor;
+        devState.enumPendingMissing = Math.max(0, owed - found);
+        saveState(state);
+    };
+
+    while (stamp < newestStamp && found < owed) {
+        if (probed >= ENUM_MAX_PROBES_PER_DEVICE) break;
+        if (Date.now() > enumDeadline || Date.now() - t0 > GLOBAL_STATION_BUDGET_MS) break;
+        const want = Math.min(ENUM_CONCURRENCY, owed - found, ENUM_MAX_PROBES_PER_DEVICE - probed);
+        const batchStamps = [];
+        let s = stamp;
+        while (batchStamps.length < want && s < newestStamp) {
+            batchStamps.push(s);
+            s = shiftStamp(s, 1);
+        }
+        if (batchStamps.length === 0) break;
+
+        // a stamp whose bundle is already in the inbox counts as found
+        // without spending a probe (state-loss insurance, mirrors v2)
+        const toProbe = [];
+        for (const bs of batchStamps) {
+            const bName = `${slugify(stationName)}-${slugify(deviceName)}-${bs}`;
+            if (fs.existsSync(path.join(INBOX_DIR, bName, "record.json"))) {
+                found++;
+                log(`${stationName}: ${deviceName}: ENUM ${bs} already in inbox — counted as found`);
+            } else {
+                toProbe.push(bs);
+            }
+        }
+
+        const outcomes = new Map(); // stamp -> {buf} | {timeout:true} | {err}
+        await Promise.all(
+            toProbe.map(async (bs) => {
+                probed++;
+                try {
+                    const buf = await channel.probeImage(buildEnumPath(template, bs));
+                    outcomes.set(bs, { buf });
+                } catch (e) {
+                    outcomes.set(bs, { timeout: isTimeoutErr(e), err: e });
+                }
+            }),
+        );
+
+        // if every probe in the batch failed with a hard (non-timeout)
+        // error, the channel is wedged — do NOT mark the batch scanned
+        const probedOutcomes = toProbe.map((bs) => outcomes.get(bs)).filter(Boolean);
+        if (toProbe.length > 0 && probedOutcomes.length > 0 && probedOutcomes.every((o) => !o.buf && !o.timeout)) {
+            log(`${stationName}: ${deviceName}: ENUM probes failing (${shortErr(probedOutcomes[0].err)}) — window left open at ${cursor}`);
+            aborted = true;
+            break;
+        }
+
+        let batchHits = 0;
+        const batchTimeouts = [];
+        for (const bs of batchStamps) {
+            const o = outcomes.get(bs);
+            if (o?.buf) {
+                batchHits++;
+                deliver(bs, o.buf);
+            } else if (o?.timeout) {
+                batchTimeouts.push(bs);
+            }
+        }
+        // safeguard: a timeout next to hits may be concurrency starvation,
+        // not a true miss — re-probe those stamps once, sequentially
+        if (batchHits > 0) {
+            for (const bs of batchTimeouts) {
+                if (found >= owed || probed >= ENUM_MAX_PROBES_PER_DEVICE) break;
+                probed++;
+                try {
+                    const buf = await channel.probeImage(buildEnumPath(template, bs));
+                    deliver(bs, buf);
+                    log(`${stationName}: ${deviceName}: ENUM ${bs} hit on sequential re-probe`);
+                } catch {
+                    /* true miss */
+                }
+            }
+        }
+
+        cursor = batchStamps[batchStamps.length - 1];
+        stamp = shiftStamp(cursor, 1);
+        persist();
+    }
+
+    if (!aborted && (found >= owed || stamp >= newestStamp)) {
+        windowClosed = true;
+        if (found < owed) {
+            log(
+                `${stationName}: ${deviceName}: ENUM window exhausted with ${owed - found} counted event(s) unmatched ` +
+                    `(no snapshot at any second in the window — count/snapshot mismatch); closing window`,
+            );
+        }
+        cursor = newestStamp;
+    }
+    devState.enumCursorStamp = cursor;
+    devState.enumPendingMissing = windowClosed ? 0 : Math.max(0, owed - found);
+    saveState(state);
+    log(
+        `${stationName}: ${deviceName}: ENUM window ${shiftStamp(startCursor, 1)}..${newestStamp} probed=${probed} found=${found} of owed=${owed} ` +
+            `elapsed=${((Date.now() - tStart) / 1000).toFixed(1)}s${windowClosed ? " (window closed)" : ` (bounds hit — resumes from ${cursor} next sweep)`}`,
+    );
+    return { bundles, thumbs: thumbsAdded, maxEventMs };
+}
+
 async function sweepStation({ station, state, deviceBySerial }) {
     const name = station.getName();
     const stState = stationState(state, name);
@@ -488,6 +724,7 @@ async function sweepStation({ station, state, deviceBySerial }) {
         return { ok: false, reason: `latest-info failed: ${shortErr(e)}` };
     }
     log(`${name}: latest-info answered for ${latest.length} device(s)`);
+    const enumDeadline = Date.now() + ENUM_STATION_BUDGET_MS;
 
     let newCount = 0;
     let thumbs = 0;
@@ -508,81 +745,128 @@ async function sweepStation({ station, state, deviceBySerial }) {
             log(`${name}: ${deviceName}: no snapshot path in latest-info (event_count=${eventCount})`);
             continue;
         }
+        const newestStamp = parsePathStamp(cropPath);
+        const prevCount = storedDev && typeof storedDev.eventCount === "number" ? storedDev.eventCount : null;
+        const countDelta = eventCount !== null && prevCount !== null ? eventCount - prevCount : null;
+        let newestCaptured = false;
         if (storedDev?.cropPath === cropPath) {
-            if (storedDev.eventCount !== eventCount) {
-                storedDev.eventCount = eventCount;
-                dirty = true;
-            }
             log(`${name}: ${deviceName}: no new event (event_count=${eventCount})`);
-            continue;
-        }
-
-        // ---- new latest event for this device --------------------------------
-        const digits = parsePathStamp(cropPath);
-        const eventMs = digits ? wallStampToMs(digits) : null;
-        const countDelta = storedDev && eventCount !== null && typeof storedDev.eventCount === "number" ? eventCount - storedDev.eventCount : null;
-        log(
-            `${name}: ${deviceName}: NEW event ${digits ? fmtLocal(eventMs) : "(unstamped path)"} ` +
-                `(event_count=${eventCount}${countDelta !== null ? `, delta=${countDelta}` : ""})`,
-        );
-        const bundleName = `${slugify(name)}-${slugify(deviceName)}-${digits ?? `count${eventCount ?? "x"}`}`;
-        const bundleDir = path.join(INBOX_DIR, bundleName);
-
-        if (fs.existsSync(path.join(bundleDir, "record.json"))) {
-            // Already delivered by an earlier run whose state write was lost.
-            log(`${name}: ${deviceName}: bundle ${bundleName} already in inbox — marking seen without re-download`);
         } else {
-            fs.mkdirSync(bundleDir, { recursive: true });
-            const bundle = {
-                recordId: bundleName,
-                station: name,
-                device: deviceName,
-                model: deviceObj?.getModel() ?? null,
-                source: "latest-info",
-                startUtc: eventMs !== null ? new Date(eventMs).toISOString() : null,
-                endUtc: eventMs !== null ? new Date(eventMs).toISOString() : null,
-                startMs: eventMs,
-                endMs: eventMs,
-                startLocal: eventMs !== null ? fmtLocal(eventMs) : null,
-                endLocal: eventMs !== null ? fmtLocal(eventMs) : null,
-                durationSec: null,
-                triggerType: null,
-                triggerName: null,
-                videoType: null,
-                videoName: null,
-                personFlagged: null, // latest-info carries no classification; GG judges the snapshot
-                eventCount,
-                countDelta,
-                thumbFile: null,
-                thumbBytes: null,
-                thumbError: null,
-                clipFile: null,
-                clipBytes: null,
-                clipError: null,
-                clipSkipped:
-                    "clips are not reachable on current firmware: the event-database row queries return nothing (see RELAY-BUILD.md); only the newest event snapshot per device is exposed",
-                sweptAt: new Date().toISOString(),
-            };
-            try {
-                const buf = await channel.downloadImage(cropPath);
-                const file = `thumb${sniffImage(buf)}`;
-                fs.writeFileSync(path.join(bundleDir, file), buf);
-                bundle.thumbFile = file;
-                bundle.thumbBytes = buf.length;
-                thumbs++;
-            } catch (e) {
-                bundle.thumbError = shortErr(e);
-                log(`${name}: ${deviceName}: snapshot download failed: ${shortErr(e)}`);
+            // ---- new latest event for this device --------------------------------
+            const digits = newestStamp;
+            const eventMs = digits ? wallStampToMs(digits) : null;
+            log(
+                `${name}: ${deviceName}: NEW event ${digits ? fmtLocal(eventMs) : "(unstamped path)"} ` +
+                    `(event_count=${eventCount}${countDelta !== null ? `, delta=${countDelta}` : ""})`,
+            );
+            const bundleName = `${slugify(name)}-${slugify(deviceName)}-${digits ?? `count${eventCount ?? "x"}`}`;
+            const bundleDir = path.join(INBOX_DIR, bundleName);
+
+            if (fs.existsSync(path.join(bundleDir, "record.json"))) {
+                // Already delivered by an earlier run whose state write was lost.
+                log(`${name}: ${deviceName}: bundle ${bundleName} already in inbox — marking seen without re-download`);
+            } else {
+                fs.mkdirSync(bundleDir, { recursive: true });
+                const bundle = {
+                    recordId: bundleName,
+                    station: name,
+                    device: deviceName,
+                    model: deviceObj?.getModel() ?? null,
+                    source: "latest-info",
+                    startUtc: eventMs !== null ? new Date(eventMs).toISOString() : null,
+                    endUtc: eventMs !== null ? new Date(eventMs).toISOString() : null,
+                    startMs: eventMs,
+                    endMs: eventMs,
+                    startLocal: eventMs !== null ? fmtLocal(eventMs) : null,
+                    endLocal: eventMs !== null ? fmtLocal(eventMs) : null,
+                    durationSec: null,
+                    triggerType: null,
+                    triggerName: null,
+                    videoType: null,
+                    videoName: null,
+                    personFlagged: null, // latest-info carries no classification; GG judges the snapshot
+                    eventCount,
+                    countDelta,
+                    thumbFile: null,
+                    thumbBytes: null,
+                    thumbError: null,
+                    clipFile: null,
+                    clipBytes: null,
+                    clipError: null,
+                    clipSkipped:
+                        "clips are not reachable on current firmware: the event-database row queries return nothing (see RELAY-BUILD.md); only the newest event snapshot per device is exposed",
+                    sweptAt: new Date().toISOString(),
+                };
+                try {
+                    const buf = await channel.downloadImage(cropPath);
+                    const file = `thumb${sniffImage(buf)}`;
+                    fs.writeFileSync(path.join(bundleDir, file), buf);
+                    bundle.thumbFile = file;
+                    bundle.thumbBytes = buf.length;
+                    thumbs++;
+                } catch (e) {
+                    bundle.thumbError = shortErr(e);
+                    log(`${name}: ${deviceName}: snapshot download failed: ${shortErr(e)}`);
+                }
+                // record.json last: a bundle dir containing record.json is complete
+                fs.writeFileSync(path.join(bundleDir, "record.json"), JSON.stringify(bundle, null, 2));
+                newCount++;
             }
-            // record.json last: a bundle dir containing record.json is complete
-            fs.writeFileSync(path.join(bundleDir, "record.json"), JSON.stringify(bundle, null, 2));
-            newCount++;
+
+            // newest snapshot delivered; the per-device state write (now
+            // carrying the v3 enum fields) happens once, after enumeration
+            newestCaptured = true;
+            dirty = true;
+            if (eventMs !== null && eventMs > maxEventMs) maxEventMs = eventMs;
         }
 
-        // state for this device advances only now (bundle fully written)
-        stState.devices[deviceName] = { cropPath, eventCount };
-        dirty = true;
-        if (eventMs !== null && eventMs > maxEventMs) maxEventMs = eventMs;
+        // ---- v3: per-device state + bounded enumeration of the gap --------
+        const devState = {
+            cropPath,
+            eventCount,
+            enumCursorStamp: storedDev?.enumCursorStamp ?? null,
+            enumPendingMissing: typeof storedDev?.enumPendingMissing === "number" ? storedDev.enumPendingMissing : 0,
+        };
+        stState.devices[deviceName] = devState;
+        const template = newestStamp ? parseEnumTemplate(cropPath) : null;
+        const freshMissing = countDelta !== null ? Math.max(0, countDelta - (newestCaptured ? 1 : 0)) : 0;
+        const owed = devState.enumPendingMissing + freshMissing;
+        if (!template) {
+            // path family is not enumerable (e.g. Front Door /video/<stamp>_c00.jpg)
+            if (owed > 0) {
+                log(`${name}: ${deviceName}: ${owed} missed event(s) counted, but this path family is not enumerable — snapshots not recoverable`);
+            }
+            devState.enumPendingMissing = 0;
+            devState.enumCursorStamp = null;
+        } else if (newestStamp) {
+            if (!devState.enumCursorStamp) {
+                // first sight of this device (or pre-v3 state): the window
+                // opens at the previously stored stamp; with none, no window
+                devState.enumCursorStamp = storedDev ? parsePathStamp(storedDev.cropPath) ?? newestStamp : newestStamp;
+            }
+            if (owed > 0) {
+                const res = await enumerateMissing({
+                    channel,
+                    stationName: name,
+                    deviceName,
+                    deviceObj,
+                    template,
+                    devState,
+                    newestStamp,
+                    owed,
+                    state,
+                    enumDeadline,
+                });
+                newCount += res.bundles;
+                thumbs += res.thumbs;
+                if (res.maxEventMs > maxEventMs) maxEventMs = res.maxEventMs;
+                dirty = true;
+            } else {
+                devState.enumCursorStamp = newestStamp;
+                devState.enumPendingMissing = 0;
+            }
+        }
+        if (JSON.stringify(devState) !== JSON.stringify(storedDev ?? null)) dirty = true;
     }
 
     if (maxEventMs > (stState.watermarkMs ?? 0)) stState.watermarkMs = maxEventMs;
