@@ -30,8 +30,9 @@
  *     (verified: 21,505 bytes from the Front Door, JPEG magic confirmed).
  * Consequences, by design: each sweep delivers the NEWEST event snapshot
  * per device (plus the event-count delta, so events that arrived between
- * sweeps are counted even though only the newest is fetchable), and clips
- * are not available through this path on current firmware.
+ * sweeps are counted even though only the newest is fetchable). The
+ * v3 enumeration and v4 clip fetching layered on top are described in
+ * their own sections below.
  *
  * Battery discipline: one latest-info round per station per sweep (the
  * client also auto-queries latest-info on connect). Timeouts get ONE
@@ -52,6 +53,18 @@
  * the same window on the next run instead of rescanning or skipping.
  * The Front Door's /video/<stamp>_c00.jpg scheme is NOT enumerated.
  *
+ * V4 — CLIP FETCHING (Experiments N + O): the event's raw .zxvideo sits
+ * next to its snapshot under the same stamp, and
+ * client.startStationDownload(deviceSN, clipPath, cipherId) streams it
+ * when given the station's stable cipher id (silence = wrong cipher or
+ * missing file). Every bundle the sweep writes — latest-info or
+ * enumerated — now also attempts the clip (bounded per station/sweep,
+ * 40 s hard cap per clip) and stores it as clip.zxvideo INSIDE the
+ * bundle. Git is transit only for clips: GG's clip-intake moves them
+ * into the VM-local rolling store (30-day retention, 20 GB cap), the
+ * review purge removes the bundle, and a weekly history reset squashes
+ * the dead clip blobs out of the data repo's git history.
+ *
  * Event times come from the snapshot filename (a 14-digit device-local
  * timestamp, America/Los_Angeles), converted to true epoch instants with
  * the same reinterpretation helpers as harness/pull-p2p-24h.mjs.
@@ -61,6 +74,7 @@
  */
 import fs from "node:fs";
 import path from "node:path";
+import crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { parseEnumTemplate, buildEnumPath, shiftStamp } from "./enum-paths.mjs";
 
@@ -91,6 +105,25 @@ const ENUM_PROBE_TIMEOUT_MS = 2_500; // exp-l: hits answer in <=0.8 s; a miss is
 const ENUM_CONCURRENCY = 6; // probes in flight per station session
 const ENUM_MAX_PROBES_PER_DEVICE = 1_500; // hard probe budget per device per sweep
 const ENUM_STATION_BUDGET_MS = 8 * 60_000; // hard enumeration budget per station per sweep
+// sweep v4 clip fetching bounds
+const CLIP_MAX_PER_STATION = 15; // clip download attempts per station per sweep
+const CLIP_START_CAP_MS = 20_000; // no "download start" within 20 s = failed clip (silence semantics)
+const CLIP_TOTAL_CAP_MS = 40_000; // hard cap per clip, including the start wait
+// Station -> cipher id for startStationDownload (stable per station;
+// proven by Experiments N + O — see RELAY-BUILD.md "Sweep v4"). Stations
+// absent here get snapshots only (their bundles say why in clipSkipped).
+// Backyard / Sideyard are absent: they have never recorded an event
+// (event_count=0), so no real event exists to discover a cipher against.
+// WifiBridge (Front Door) is absent: Experiment O trialled 3 plausible
+// clip paths × all 5 account ciphers — every trial silent (see below).
+const CIPHER_BY_STATION = {
+    Porch: 220,
+    "Living Room": 107,
+};
+const CLIP_NO_CIPHER_REASON = {
+    WifiBridge:
+        "Front Door (doorbell via WifiBridge): no clip path/cipher combination worked in Experiment O (15 trials, all silent) — snapshots only for this family",
+};
 
 const t0 = Date.now();
 const stamp = () => `+${((Date.now() - t0) / 1000).toFixed(1)}s`;
@@ -143,6 +176,19 @@ function wallStampToMs(digits) {
 function parsePathStamp(p) {
     const m = String(p ?? "").match(/(\d{14})/);
     return m ? m[1] : null;
+}
+/**
+ * v4: on-device clip path for an event whose snapshot path is known.
+ * SoloCam/indoor family: the .zxvideo sits next to the snapshot under
+ * the same stamp (Experiments N + O). (Experiment O also trialled a
+ * _c00.zxvideo sibling for the Front Door's /video/<stamp>_c00.jpg
+ * scheme — silent, like every other Front Door combination — so no
+ * rule is provided for that family.) Anything else: null.
+ */
+function clipPathForSnapshot(snapshotPath) {
+    if (typeof snapshotPath !== "string") return null;
+    if (/_snapshot\.jpg$/.test(snapshotPath)) return snapshotPath.replace(/_snapshot\.jpg$/, ".zxvideo");
+    return null;
 }
 const fmtLocal = (ms) => {
     const dtf = new Intl.DateTimeFormat("en-US", {
@@ -251,6 +297,25 @@ function ensureP2PConnected(station, timeoutMs = CONNECT_TIMEOUT_MS) {
 }
 
 // ---------------------------------------------------------------------------
+// v4 converter capture: the vendored client's session.js carries a small
+// capture patch (see RELAY-BUILD.md "Sweep v4") that calls these globals
+// for every BINARY (download) frame: __eufyCaptureFrame reports the frame
+// map entry (seqNo, emitted size, keyed flag), __eufyCaptureRaw reports a
+// keyed frame's served 128-byte payload window (the bytes the client's
+// own phantom RSA/AES transform is about to corrupt; the converter
+// restores them verbatim). Downloads are strictly sequential in this
+// sweep, so one active collector is enough; it is armed by downloadClip
+// and disarmed when the download settles.
+// ---------------------------------------------------------------------------
+let activeClipCapture = null; // { frames: [], rawFrames: [] } while a clip download runs
+globalThis.__eufyCaptureFrame = (rec) => {
+    if (activeClipCapture) activeClipCapture.frames.push(rec);
+};
+globalThis.__eufyCaptureRaw = (rec) => {
+    if (activeClipCapture) activeClipCapture.rawFrames.push(rec);
+};
+
+// ---------------------------------------------------------------------------
 // per-station channel: latest-info + image download over client events,
 // one retry on timeouts (battery cameras often answer only the second ask)
 // ---------------------------------------------------------------------------
@@ -276,6 +341,45 @@ class StationChannel {
             this.pendingImages.delete(file);
             clearTimeout(pending.timer);
             pending.resolve(image);
+        });
+        // v4: clip downloads surface as CLIENT-level events; route them to
+        // this channel's outstanding request, filtered by station serial.
+        // (Channels for earlier stations stay registered after their station
+        // closes, but their serial filter never matches a later station's
+        // events; a start that arrives with no outstanding request is
+        // drained so the stream cannot stall.)
+        this.pendingClip = null; // see downloadClip()
+        this.client.on("station download start", (station, device, metadata, videoStream, audioStream) => {
+            const pending = this.pendingClip;
+            if (station?.getSerial?.() !== this.serial || !pending || device?.getSerial?.() !== pending.deviceSN) {
+                try {
+                    videoStream?.resume?.();
+                } catch {
+                    /* ignore */
+                }
+                try {
+                    audioStream?.resume?.();
+                } catch {
+                    /* ignore */
+                }
+                return;
+            }
+            pending.started = true;
+            clearTimeout(pending.startTimer);
+            videoStream.on("data", (chunk) => {
+                const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+                pending.bytes += buf.length;
+                pending.hash.update(buf);
+                pending.writeStream.write(buf);
+            });
+            videoStream.on("error", (e) => pending.fail(new Error(`clip video stream error: ${shortErr(e)}`)));
+            if (audioStream?.resume) audioStream.resume();
+        });
+        this.client.on("station download finish", (station, device) => {
+            const pending = this.pendingClip;
+            if (station?.getSerial?.() !== this.serial || !pending || device?.getSerial?.() !== pending.deviceSN) return;
+            // let trailing chunks flush before the file is closed
+            pending.finishTimer = setTimeout(() => pending.succeed(), 750);
         });
     }
 
@@ -379,6 +483,141 @@ class StationChannel {
         const buf = Buffer.isBuffer(image) ? image : image?.data ? Buffer.from(image.data) : null;
         if (!buf || buf.length === 0) throw new Error("image download returned no data");
         return buf;
+    }
+
+    /**
+     * v4: download one event clip (.zxvideo) to destPath via
+     * client.startStationDownload(deviceSN, clipPath, cipherId),
+     * streaming bytes to disk while hashing them. Silence semantics:
+     * a wrong cipher or a missing file produces NO download-start, so
+     * the 20 s start cap is the failure signal; the whole attempt is
+     * capped at 40 s. On failure the partial file is removed and the
+     * promise rejects — a clip failure never fails the enclosing
+     * snapshot bundle (callers record it on the bundle instead).
+     * Assumes starts for a device arrive only in response to the
+     * outstanding request (observed in Experiments A2 / N / O).
+     */
+    async downloadClip({ deviceSN, clipPath, cipherId, destPath }) {
+        if (this.pendingClip) throw new Error("a clip download is already outstanding on this station");
+        return new Promise((resolve, reject) => {
+            const writeStream = fs.createWriteStream(destPath);
+            const pending = {
+                deviceSN,
+                started: false,
+                bytes: 0,
+                hash: crypto.createHash("sha256"),
+                writeStream,
+                startTimer: null,
+                totalTimer: null,
+                finishTimer: null,
+                fail: null,
+                succeed: null,
+            };
+            const capture = { frames: [], rawFrames: [] };
+            activeClipCapture = capture;
+            const cleanup = () => {
+                clearTimeout(pending.startTimer);
+                clearTimeout(pending.totalTimer);
+                clearTimeout(pending.finishTimer);
+                if (this.pendingClip === pending) this.pendingClip = null;
+                if (activeClipCapture === capture) activeClipCapture = null;
+            };
+            pending.fail = (err) => {
+                cleanup();
+                try {
+                    writeStream.destroy();
+                } catch {
+                    /* ignore */
+                }
+                try {
+                    fs.unlinkSync(destPath);
+                } catch {
+                    /* ignore */
+                }
+                reject(err);
+            };
+            pending.succeed = () => {
+                cleanup();
+                writeStream.end(() => {
+                    resolve({ bytes: pending.bytes, sha256: pending.hash.digest("hex"), capture });
+                });
+            };
+            writeStream.on("error", (e) => pending.fail(new Error(`clip file write error: ${shortErr(e)}`)));
+            pending.startTimer = setTimeout(() => {
+                if (!pending.started) pending.fail(new Error(`no download start within ${CLIP_START_CAP_MS / 1000}s (wrong cipher or missing file)`));
+            }, CLIP_START_CAP_MS);
+            pending.totalTimer = setTimeout(
+                () => pending.fail(new Error(`clip download exceeded ${CLIP_TOTAL_CAP_MS / 1000}s`)),
+                CLIP_TOTAL_CAP_MS,
+            );
+            this.pendingClip = pending;
+            Promise.resolve(this.client.startStationDownload(deviceSN, clipPath, cipherId)).catch((e) =>
+                pending.fail(new Error(`startStationDownload threw: ${shortErr(e)}`)),
+            );
+        });
+    }
+}
+
+/**
+ * v4: attempt the clip for one bundle and record the outcome on the
+ * bundle object (clipFile/clipBytes/clipSha256 on success, clipError on
+ * a failed attempt, clipSkipped when not attempted). Never throws.
+ * `budget` ({ attempts }) is shared per station per sweep and enforces
+ * CLIP_MAX_PER_STATION across latest-info and enumerated bundles alike.
+ */
+async function attachClip({ channel, deviceSN, cipherId, clipPath, bundleDir, bundle, budget, logPrefix, noCipherReason }) {
+    if (cipherId === null || cipherId === undefined) {
+        bundle.clipSkipped =
+            noCipherReason ?? "no cipher id known for this station — clip not attempted (see RELAY-BUILD.md, sweep v4 cipher map)";
+        return false;
+    }
+    if (!clipPath) {
+        bundle.clipSkipped = "no clip path derivable from this event's snapshot path";
+        return false;
+    }
+    if (budget.attempts >= CLIP_MAX_PER_STATION) {
+        bundle.clipSkipped = `clip cap reached for this sweep (${CLIP_MAX_PER_STATION} attempts per station)`;
+        return false;
+    }
+    budget.attempts++;
+    bundle.clipCipherId = cipherId;
+    try {
+        const { bytes, sha256, capture } = await channel.downloadClip({
+            deviceSN,
+            clipPath,
+            cipherId,
+            destPath: path.join(bundleDir, "clip.zxvideo"),
+        });
+        bundle.clipFile = "clip.zxvideo";
+        bundle.clipBytes = bytes;
+        bundle.clipSha256 = sha256;
+        bundle.clipError = null;
+        bundle.clipSkipped = null;
+        // Converter sidecar (CONVERT-RESULTS.md Avenue 6): the frame map +
+        // each keyed frame's served 128-byte window, captured by the
+        // vendored client's capture patch during this download. With it,
+        // conversion is lossless and direct; without it, the converter
+        // would need the deterministic garbage-key inverse.
+        if (capture && capture.frames.length > 0) {
+            fs.writeFileSync(path.join(bundleDir, "clip-frames.json"), JSON.stringify(capture, null, 2));
+            bundle.clipFramesFile = "clip-frames.json";
+            bundle.clipFrameCount = capture.frames.length;
+            bundle.clipKeyedFrames = capture.rawFrames.length;
+            const mapBytes = capture.frames.reduce((a, f) => a + (f.videoDataSize ?? 0), 0);
+            bundle.clipFrameMapOk = mapBytes === bytes;
+            if (!bundle.clipFrameMapOk) {
+                log(`${logPrefix}: WARNING frame map sums to ${mapBytes} bytes vs clip ${bytes} bytes — sidecar may be unreliable`);
+            }
+        } else {
+            bundle.clipFramesError = "no frame capture recorded for this download (vendored capture hook inactive)";
+        }
+        log(`${logPrefix}: clip fetched (${bytes} bytes, sha256 ${sha256.slice(0, 16)}…, frames=${capture?.frames.length ?? 0}, keyed=${capture?.rawFrames.length ?? 0})`);
+        return true;
+    } catch (e) {
+        bundle.clipError = shortErr(e);
+        bundle.clipSkipped = null;
+        log(`${logPrefix}: clip fetch failed: ${shortErr(e)}`);
+        return false;
     }
 }
 
@@ -530,20 +769,21 @@ async function main() {
 // devState (enumCursorStamp / enumPendingMissing), so a bounded-out sweep
 // resumes the same window next run instead of rescanning or skipping.
 // ---------------------------------------------------------------------------
-async function enumerateMissing({ channel, stationName, deviceName, deviceObj, template, devState, newestStamp, owed, state, enumDeadline }) {
+async function enumerateMissing({ channel, stationName, deviceName, deviceObj, template, devState, newestStamp, owed, state, enumDeadline, clipCtx }) {
     const tStart = Date.now();
     const startCursor = devState.enumCursorStamp;
     let probed = 0;
     let found = 0;
     let bundles = 0;
     let thumbsAdded = 0;
+    let clipsAdded = 0;
     let maxEventMs = 0;
     let cursor = startCursor;
     let stamp = shiftStamp(cursor, 1);
     let windowClosed = false;
     let aborted = false;
 
-    const deliver = (bs, buf) => {
+    const deliver = async (bs, buf) => {
         found++;
         const bundleName = `${slugify(stationName)}-${slugify(deviceName)}-${bs}`;
         const bundleDir = path.join(INBOX_DIR, bundleName);
@@ -575,15 +815,40 @@ async function enumerateMissing({ channel, stationName, deviceName, deviceObj, t
             thumbError: null,
             clipFile: null,
             clipBytes: null,
+            clipSha256: null,
+            clipCipherId: null,
+            clipFramesFile: null,
+            clipFrameCount: null,
+            clipKeyedFrames: null,
+            clipFrameMapOk: null,
+            clipFramesError: null,
             clipError: null,
-            clipSkipped:
-                "clips are not reachable on current firmware: the event-database row queries return nothing (see RELAY-BUILD.md); snapshots are recovered by bounded path enumeration (sweep v3)",
+            clipSkipped: null,
             sweptAt: new Date().toISOString(),
         };
         const file = `thumb${sniffImage(buf)}`;
         fs.writeFileSync(path.join(bundleDir, file), buf);
         bundle.thumbFile = file;
         bundle.thumbBytes = buf.length;
+        // v4: fetch the event's raw clip alongside its snapshot
+        if (clipCtx) {
+            if (Date.now() <= enumDeadline) {
+                const gotClip = await attachClip({
+                    channel,
+                    deviceSN: clipCtx.deviceSN,
+                    cipherId: clipCtx.cipherId,
+                    clipPath: clipPathForSnapshot(buildEnumPath(template, bs)),
+                    bundleDir,
+                    bundle,
+                    budget: clipCtx.budget,
+                    logPrefix: `${stationName}: ${deviceName}`,
+                    noCipherReason: clipCtx.noCipherReason,
+                });
+                if (gotClip) clipsAdded++;
+            } else {
+                bundle.clipSkipped = "station enumeration budget exhausted before clip fetch";
+            }
+        }
         // record.json last: a bundle dir containing record.json is complete
         fs.writeFileSync(path.join(bundleDir, "record.json"), JSON.stringify(bundle, null, 2));
         bundles++;
@@ -650,7 +915,7 @@ async function enumerateMissing({ channel, stationName, deviceName, deviceObj, t
             const o = outcomes.get(bs);
             if (o?.buf) {
                 batchHits++;
-                deliver(bs, o.buf);
+                await deliver(bs, o.buf);
             } else if (o?.timeout) {
                 batchTimeouts.push(bs);
             }
@@ -663,7 +928,7 @@ async function enumerateMissing({ channel, stationName, deviceName, deviceObj, t
                 probed++;
                 try {
                     const buf = await channel.probeImage(buildEnumPath(template, bs));
-                    deliver(bs, buf);
+                    await deliver(bs, buf);
                     log(`${stationName}: ${deviceName}: ENUM ${bs} hit on sequential re-probe`);
                 } catch {
                     /* true miss */
@@ -693,7 +958,7 @@ async function enumerateMissing({ channel, stationName, deviceName, deviceObj, t
         `${stationName}: ${deviceName}: ENUM window ${shiftStamp(startCursor, 1)}..${newestStamp} probed=${probed} found=${found} of owed=${owed} ` +
             `elapsed=${((Date.now() - tStart) / 1000).toFixed(1)}s${windowClosed ? " (window closed)" : ` (bounds hit — resumes from ${cursor} next sweep)`}`,
     );
-    return { bundles, thumbs: thumbsAdded, maxEventMs };
+    return { bundles, thumbs: thumbsAdded, clips: clipsAdded, maxEventMs };
 }
 
 async function sweepStation({ station, state, deviceBySerial }) {
@@ -728,6 +993,8 @@ async function sweepStation({ station, state, deviceBySerial }) {
 
     let newCount = 0;
     let thumbs = 0;
+    let clips = 0;
+    const clipBudget = { attempts: 0 }; // v4: shared across this station's bundles
     let dirty = false;
     let maxEventMs = stState.watermarkMs ?? 0;
 
@@ -792,9 +1059,15 @@ async function sweepStation({ station, state, deviceBySerial }) {
                     thumbError: null,
                     clipFile: null,
                     clipBytes: null,
+                    clipSha256: null,
+                    clipCipherId: null,
+                    clipFramesFile: null,
+                    clipFrameCount: null,
+                    clipKeyedFrames: null,
+                    clipFrameMapOk: null,
+                    clipFramesError: null,
                     clipError: null,
-                    clipSkipped:
-                        "clips are not reachable on current firmware: the event-database row queries return nothing (see RELAY-BUILD.md); only the newest event snapshot per device is exposed",
+                    clipSkipped: null,
                     sweptAt: new Date().toISOString(),
                 };
                 try {
@@ -808,6 +1081,19 @@ async function sweepStation({ station, state, deviceBySerial }) {
                     bundle.thumbError = shortErr(e);
                     log(`${name}: ${deviceName}: snapshot download failed: ${shortErr(e)}`);
                 }
+                // v4: fetch the event's raw clip alongside its snapshot
+                const gotClip = await attachClip({
+                    channel,
+                    deviceSN: entry.device_sn,
+                    cipherId: CIPHER_BY_STATION[name] ?? null,
+                    clipPath: clipPathForSnapshot(cropPath),
+                    bundleDir,
+                    bundle,
+                    budget: clipBudget,
+                    logPrefix: `${name}: ${deviceName}`,
+                    noCipherReason: CLIP_NO_CIPHER_REASON[name] ?? null,
+                });
+                if (gotClip) clips++;
                 // record.json last: a bundle dir containing record.json is complete
                 fs.writeFileSync(path.join(bundleDir, "record.json"), JSON.stringify(bundle, null, 2));
                 newCount++;
@@ -856,9 +1142,16 @@ async function sweepStation({ station, state, deviceBySerial }) {
                     owed,
                     state,
                     enumDeadline,
+                    clipCtx: {
+                        deviceSN: entry.device_sn,
+                        cipherId: CIPHER_BY_STATION[name] ?? null,
+                        budget: clipBudget,
+                        noCipherReason: CLIP_NO_CIPHER_REASON[name] ?? null,
+                    },
                 });
                 newCount += res.bundles;
                 thumbs += res.thumbs;
+                clips += res.clips ?? 0;
                 if (res.maxEventMs > maxEventMs) maxEventMs = res.maxEventMs;
                 dirty = true;
             } else {
@@ -876,7 +1169,7 @@ async function sweepStation({ station, state, deviceBySerial }) {
     } else {
         log(`${name}: no changes`);
     }
-    return { ok: true, newCount, thumbs, clips: 0 };
+    return { ok: true, newCount, thumbs, clips };
 }
 
 main().catch((e) => {

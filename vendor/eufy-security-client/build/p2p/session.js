@@ -1851,6 +1851,19 @@ class P2PClientProtocol extends tiny_typed_emitter_1.TypedEmitter {
                     let payloadStart = 22;
                     if (message.signCode > 0 && data_length >= 128) {
                         const key = message.data.subarray(22, 150);
+                        // SWEEP V4 CAPTURE PATCH (production, GG relay): hand the
+                        // raw prefix blob + the SERVED 128-byte payload window of
+                        // this keyed (GOP-head) frame to the sweep's collector.
+                        // The window is what this client is about to corrupt with
+                        // its phantom RSA/AES transform; the converter restores
+                        // it verbatim (see CONVERT-RESULTS.md). Capture only —
+                        // the stream itself is untouched.
+                        try {
+                            if (globalThis.__eufyCaptureRaw && types_1.P2PDataType[message.dataType] === "BINARY") {
+                                globalThis.__eufyCaptureRaw({ seqNo: videoMetaData.videoSeqNo, wrapped: key.toString("hex"), wire: message.data.subarray(151, 279).toString("hex"), head: message.data.subarray(0, 512).toString("hex") });
+                            }
+                        }
+                        catch { /* ignore */ }
                         const rsaKey = this.currentMessageState[message.dataType].rsaKey;
                         if (rsaKey) {
                             try {
@@ -1891,6 +1904,23 @@ class P2PClientProtocol extends tiny_typed_emitter_1.TypedEmitter {
                     else {
                         video_data = message.data.subarray(payloadStart, payloadStart + videoMetaData.videoDataLength);
                     }
+                    // SWEEP V4 CAPTURE PATCH (production, GG relay): report the
+                    // frame map entry for this frame (emitted size + keyed flag)
+                    // so the sweep can write the converter's sidecar next to
+                    // each downloaded clip. Capture only — no behaviour change.
+                    try {
+                        if (globalThis.__eufyCaptureFrame && types_1.P2PDataType[message.dataType] === "BINARY") {
+                            globalThis.__eufyCaptureFrame({
+                                seqNo: videoMetaData.videoSeqNo,
+                                videoDataSize: video_data.length,
+                                keyed: videoMetaData.aesKey !== "",
+                                width: videoMetaData.videoWidth,
+                                height: videoMetaData.videoHeight,
+                                fps: videoMetaData.videoFPS,
+                            });
+                        }
+                    }
+                    catch { /* ignore */ }
                     logging_1.rootP2PLogger.trace(`Handle DATA ${types_1.P2PDataType[message.dataType]} - CMD_VIDEO_FRAME`, {
                         stationSN: this.rawStation.station_sn,
                         dataSize: message.data.length,
