@@ -53,6 +53,14 @@
  * the same window on the next run instead of rescanning or skipping.
  * The Front Door's /video/<stamp>_c00.jpg scheme is NOT enumerated.
  *
+ * V4.1 — IMAGE-RESPONSE ATTRIBUTION HARDENING (Experiment R/R2): a
+ * downloaded image is credited to a requested path ONLY when the
+ * response event is from the same station AND its station-reported
+ * file exactly matches a pending request (see image-channel.mjs).
+ * Before v4.1 the sweep already keyed on the file; v4.1 adds the
+ * station-serial check (every other handler in StationChannel had one)
+ * and moves the logic into a unit-tested module.
+ *
  * V4 — CLIP FETCHING (Experiments N + O): the event's raw .zxvideo sits
  * next to its snapshot under the same stamp, and
  * client.startStationDownload(deviceSN, clipPath, cipherId) streams it
@@ -77,6 +85,7 @@ import path from "node:path";
 import crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { parseEnumTemplate, buildEnumPath, shiftStamp } from "./enum-paths.mjs";
+import { ImageAttribution } from "./image-channel.mjs";
 
 const USERNAME = process.env.EUFY_USERNAME || "";
 const COUNTRY = "US";
@@ -326,7 +335,11 @@ class StationChannel {
         this.serial = station.getSerial();
         this.name = station.getName();
         this.pendingLatest = null; // {resolve, reject, timer}
-        this.pendingImages = new Map(); // filePath -> {resolve, reject, timer}
+        // v4.1: image-response attribution lives in ImageAttribution —
+        // an event settles a request only if it is from THIS station and
+        // its station-reported file exactly matches a pending path (see
+        // image-channel.mjs for the Experiment R race this guards).
+        this.pendingImages = new ImageAttribution(this.serial);
         this.client.on("station database query latest", (station, returnCode, data) => {
             if (station?.getSerial?.() !== this.serial || !this.pendingLatest) return;
             const pending = this.pendingLatest;
@@ -336,11 +349,7 @@ class StationChannel {
             else pending.resolve(Array.isArray(data) ? data : []);
         });
         this.client.on("station image download", (station, file, image) => {
-            const pending = this.pendingImages.get(file);
-            if (!pending) return;
-            this.pendingImages.delete(file);
-            clearTimeout(pending.timer);
-            pending.resolve(image);
+            this.pendingImages.route(station?.getSerial?.(), file, image);
         });
         // v4: clip downloads surface as CLIENT-level events; route them to
         // this channel's outstanding request, filtered by station serial.
@@ -419,19 +428,15 @@ class StationChannel {
         if (this.pendingImages.has(filePath)) throw new Error("an image download is already outstanding for this path");
         const p = new Promise((resolve, reject) => {
             const timer = setTimeout(() => {
-                this.pendingImages.delete(filePath);
-                reject(new Error(`timeout after ${IMAGE_TIMEOUT_MS}ms waiting for image download`));
+                const entry = this.pendingImages.expire(filePath);
+                if (entry) entry.reject(new Error(`timeout after ${IMAGE_TIMEOUT_MS}ms waiting for image download`));
             }, IMAGE_TIMEOUT_MS);
-            this.pendingImages.set(filePath, { resolve, reject, timer });
+            this.pendingImages.register(filePath, { resolve, reject, timer });
         });
         try {
             this.station.downloadImage(filePath);
         } catch (e) {
-            const pending = this.pendingImages.get(filePath);
-            if (pending) {
-                this.pendingImages.delete(filePath);
-                clearTimeout(pending.timer);
-            }
+            this.pendingImages.drop(filePath);
             throw e;
         }
         const image = await p;
@@ -464,19 +469,15 @@ class StationChannel {
         if (this.pendingImages.has(filePath)) throw new Error("an image download is already outstanding for this path");
         const p = new Promise((resolve, reject) => {
             const timer = setTimeout(() => {
-                this.pendingImages.delete(filePath);
-                reject(new Error(`probe timeout after ${timeoutMs}ms waiting for image`));
+                const entry = this.pendingImages.expire(filePath);
+                if (entry) entry.reject(new Error(`probe timeout after ${timeoutMs}ms waiting for image`));
             }, timeoutMs);
-            this.pendingImages.set(filePath, { resolve, reject, timer });
+            this.pendingImages.register(filePath, { resolve, reject, timer });
         });
         try {
             this.station.downloadImage(filePath);
         } catch (e) {
-            const pending = this.pendingImages.get(filePath);
-            if (pending) {
-                this.pendingImages.delete(filePath);
-                clearTimeout(pending.timer);
-            }
+            this.pendingImages.drop(filePath);
             throw e;
         }
         const image = await p;
