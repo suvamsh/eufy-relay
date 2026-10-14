@@ -81,6 +81,7 @@ const VENDOR_ENTRY = path.join(VENDOR_DIR, "build", "index.js");
 const DATA_DIR = process.env.RELAY_DATA_DIR ? path.resolve(process.env.RELAY_DATA_DIR) : path.join(ROOT, "data");
 const INBOX_DIR = path.join(DATA_DIR, "inbox");
 const HEARTBEAT_FILE = path.join(DATA_DIR, "listener-state.json");
+const PUSH_LOG_FILE = path.join(DATA_DIR, "push-log.jsonl");
 const DEVICE_TZ = "America/Los_Angeles";
 const REPO = process.env.GH_REPO || "suvamsh/eufy-relay";
 
@@ -324,6 +325,25 @@ function writeHeartbeatFile() {
 async function syncHeartbeat(message) {
     writeHeartbeatFile();
     return syncData(message);
+}
+
+// ---------------------------------------------------------------------------
+// push ledger (push-log.jsonl in the data repo) — the PUSH half of the
+// standing SWEEP-vs-PUSH DIFF (Suvamsh's directive, Oct 13, 2026: the
+// hourly sweep is ground truth; push is UNPROVEN until the diff runs
+// clean). One "push" entry per message received (any type, before
+// filtering) and one "handled" entry per bundle written. Entries ride
+// the normal heartbeat/bundle syncs (git add -A). The GG-side
+// relay-vm/push-diff.mjs joins these against review-log.md (the judged
+// sweep+push event record) and maintains hidden_files/push-diff.md.
+// Fields are names/stamps only — never serials or session material.
+// ---------------------------------------------------------------------------
+function appendPushLog(entry) {
+    try {
+        fs.appendFileSync(PUSH_LOG_FILE, JSON.stringify(entry) + "\n");
+    } catch {
+        /* the ledger must never break push handling */
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -656,6 +676,25 @@ async function handlePush(m) {
     const content = typeof m?.content === "string" ? m.content : "";
     const deviceSN = typeof m?.device_sn === "string" ? m.device_sn : null;
 
+    // Ledger first, before any filtering: EVERY message counts for the diff.
+    {
+        const fp0 = typeof m?.file_path === "string" ? m.file_path : "";
+        const sessionDigits0 = typeof m?.event_session === "string" ? m.event_session.replace(/\D/g, "") : "";
+        const stampDigits0 =
+            parsePathStamp(fp0) ||
+            (sessionDigits0.length === 14 ? sessionDigits0 : null) ||
+            (typeof m?.event_time === "number" && m.event_time > 0 ? msToWallDigits(m.event_time) : null);
+        appendPushLog({
+            kind: "push",
+            receivedAt,
+            linkId: heartbeat.linkId,
+            device: deviceSN ? deviceBySerial.get(deviceSN)?.getName() ?? null : null,
+            stampDigits: stampDigits0,
+            hasPath: fp0.length > 0,
+            content: content || null,
+        });
+    }
+
     // Lock / fingerprint notifications ride the same push channel but are
     // not camera events (they carry person_name, never a media path).
     if (m?.person_name || /lock|unlock|fingerprint/i.test(content)) {
@@ -843,6 +882,15 @@ async function handlePush(m) {
     fs.writeFileSync(path.join(bundleDir, "record.json"), JSON.stringify(bundle, null, 2));
     heartbeat.pushesHandled++;
     heartbeat.bundlesWritten++;
+    appendPushLog({
+        kind: "handled",
+        receivedAt,
+        linkId: heartbeat.linkId,
+        device: deviceName,
+        stampDigits,
+        bundle: bundleName,
+        pushLatencyMs: bundle.pushLatencyMs,
+    });
     heartbeat.lastEvent = { device: deviceName, stamp: stampDigits, at: receivedAt };
     disconnectStation(stationObj);
     await syncHeartbeat(`push ${bundleName}`);
