@@ -46,7 +46,7 @@ const VENDOR_ENTRY = path.join(ROOT, "vendor", "eufy-security-client", "build", 
 const DATA_DIR = process.env.RELAY_DATA_DIR ? path.resolve(process.env.RELAY_DATA_DIR) : path.join(ROOT, "data");
 const AWAY_FILE = path.join(DATA_DIR, "away-state.json");
 const CAMERA_NAME = "Living Room";
-const REPO = process.env.GH_REPO || "suvamsh/eufy-relay";
+const REPO = process.env.GH_REPO || "suvamsh/muse-security-guard";
 
 const t0 = Date.now();
 const stamp = () => `+${((Date.now() - t0) / 1000).toFixed(1)}s`;
