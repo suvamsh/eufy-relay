@@ -1,0 +1,109 @@
+name: listener
+
+# Eufy push listener (security-guard program, Stage 1): a long-lived job
+# (one "link", ~5.5 h) that restores the stored guest session, holds the
+# FCM push registration the client creates on connect, and the moment a
+# camera event pushes, pulls that event's snapshot + clip over P2P by
+# the push's exact file_path and commits a priority bundle to the
+# private data repo (suvamsh/eufy-relay-data) over SSH with the write
+# deploy key. Before its listen window ends, a link dispatches its
+# successor (self-chaining via workflow_dispatch, which is exempt from
+# GitHub's GITHUB_TOKEN recursion guard); the concurrency group below
+# holds the successor pending until this link exits, so links never
+# pile up. The 6-hourly schedule is only a safety net (GitHub cron has
+# proven unreliable here); GG's fast-lane judge cron is the dead-man's
+# switch that watches the heartbeat in listener-state.json.
+# This repo contains code + workflow only: no secrets, no session data,
+# no state, no camera media.
+
+on:
+  workflow_dispatch:
+    inputs:
+      listen_minutes:
+        description: "Listen window for this link (minutes)"
+        required: false
+        default: "320"
+      chain:
+        description: "Dispatch a successor link before this one ends"
+        type: boolean
+        required: false
+        default: true
+  schedule:
+    - cron: "23 */6 * * *"
+
+concurrency:
+  group: eufy-listener
+  cancel-in-progress: false
+
+permissions:
+  contents: read # the data-repo push goes over SSH (deploy key), not this token
+  actions: write # self-chaining: a link dispatches its successor
+
+jobs:
+  listen:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: vendor/eufy-security-client/package-lock.json
+
+      - name: Materialize stored session (secret, never printed)
+        env:
+          EUFY_PERSISTENT_JSON: ${{ secrets.EUFY_PERSISTENT_JSON }}
+        run: |
+          umask 077
+          mkdir -p app/persistent-data
+          printf '%s' "$EUFY_PERSISTENT_JSON" > app/persistent-data/persistent.json
+
+      - name: Materialize data-repo deploy key (for the listener's git pushes)
+        env:
+          DATA_DEPLOY_KEY: ${{ secrets.DATA_DEPLOY_KEY }}
+        run: |
+          umask 077
+          mkdir -p ~/.ssh
+          printf '%s\n' "$DATA_DEPLOY_KEY" > ~/.ssh/data_deploy_key
+          chmod 600 ~/.ssh/data_deploy_key
+
+      - name: Checkout data repo (SSH deploy key)
+        uses: actions/checkout@v4
+        with:
+          repository: suvamsh/eufy-relay-data
+          ssh-key: ${{ secrets.DATA_DEPLOY_KEY }}
+          path: data
+
+      - name: Configure data repo git identity
+        run: |
+          git -C data config user.name "eufy-relay"
+          git -C data config user.email "eufy-relay@localhost"
+
+      - name: Install vendored client dependencies
+        working-directory: vendor/eufy-security-client
+        run: npm ci --no-audit --no-fund
+
+      - name: Run listener link
+        env:
+          EUFY_USERNAME: ${{ secrets.EUFY_USERNAME }}
+          RELAY_DATA_DIR: ${{ github.workspace }}/data
+          DATA_SSH_KEY_FILE: /home/runner/.ssh/data_deploy_key
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          LISTEN_MINUTES: ${{ inputs.listen_minutes || '320' }}
+          LISTENER_CHAIN: ${{ inputs.chain }}
+        run: |
+          set -o pipefail
+          node app/listener.mjs 2>&1 | tee listener.log
+
+      - name: Upload listener log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: listener-log
+          path: listener.log
+          if-no-files-found: warn
