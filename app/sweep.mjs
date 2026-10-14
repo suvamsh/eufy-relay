@@ -46,12 +46,33 @@
  * 0.13–0.8 s (byte-identical JPEGs), while a nonexistent path gets
  * silence (no error). So when a device's event-count delta says events
  * arrived that the newest-only v2 step did not deliver, the sweep probes
- * the seconds between the stored snapshot and the newest one, ascending,
- * and bundles every snapshot it finds. Probing is hard-bounded (see the
- * ENUM_* constants) and resumable: per-device progress lives in state
+ * the seconds between the stored snapshot and the newest one and bundles
+ * every snapshot it finds. Probing is hard-bounded (see the ENUM_*
+ * constants) and resumable: per-device progress lives in state
  * (enumCursorStamp / enumPendingMissing), so a bounded-out sweep resumes
  * the same window on the next run instead of rescanning or skipping.
- * The Front Door's /video/<stamp>_c00.jpg scheme is NOT enumerated.
+ *
+ * V4.2 — COVERAGE INTEGRITY (Stage 2, Oct 13, 2026): three changes.
+ * (a) CLUSTER-FIRST ENUMERATION: missed events arrive in bursts around
+ *     captured ones, so enumeration first probes ±5-minute windows
+ *     around the device's own recently captured stamps (the newest
+ *     event, the previously stored one, and every hit found during the
+ *     scan), then resumes the v3 ascending cursor scan. The persisted
+ *     cursor contract is unchanged: it only ever advances over
+ *     contiguously scanned territory.
+ * (b) FRONT DOOR ENUMERATION: the doorbell's
+ *     /media/mmcblk0p1/video/<stamp>_c00.jpg family joins enumeration
+ *     (exp-r proved constructed Front Door paths answer). Snapshots
+ *     only — Experiment O proved no clip path/cipher exists for it.
+ * (c) HEALTH TRACKING + DARK-CAMERA RULE: every sweep records per-device
+ *     contact health in state.json (see health.mjs). A device with ≥3
+ *     consecutive failed contacts, or >6h since its last successful
+ *     contact, is DARK: the sweep writes an alert marker to alerts/ in
+ *     the data repo (re-raised at most daily while dark; removed on
+ *     recovery). GG's hourly review loop surfaces markers as alerts.
+ *     Livestream liveness classifications (app/liveness.mjs) ride in
+ *     the same health record, so a dark alert can say whether the
+ *     camera itself is alive-but-quiet, unreachable, or disabled.
  *
  * V4.1 — IMAGE-RESPONSE ATTRIBUTION HARDENING (Experiment R/R2): a
  * downloaded image is credited to a requested path ONLY when the
@@ -84,8 +105,9 @@ import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
-import { parseEnumTemplate, buildEnumPath, shiftStamp } from "./enum-paths.mjs";
+import { parseEnumTemplate, buildEnumPath, shiftStamp, clusterWindowStamps } from "./enum-paths.mjs";
 import { ImageAttribution } from "./image-channel.mjs";
+import { deviceHealth, recordContactOk, recordContactFail, evaluateDark, shouldWriteMarker } from "./health.mjs";
 
 const USERNAME = process.env.EUFY_USERNAME || "";
 const COUNTRY = "US";
@@ -98,6 +120,7 @@ const VENDOR_ENTRY = path.join(VENDOR_DIR, "build", "index.js");
 const DATA_DIR = process.env.RELAY_DATA_DIR ? path.resolve(process.env.RELAY_DATA_DIR) : path.join(ROOT, "data");
 const STATE_FILE = path.join(DATA_DIR, "state.json");
 const INBOX_DIR = path.join(DATA_DIR, "inbox");
+const ALERTS_DIR = path.join(DATA_DIR, "alerts"); // v4.2: dark-camera alert markers (see health.mjs)
 const DEVICE_TZ = "America/Los_Angeles";
 
 const STATION_ORDER = ["WifiBridge", "Porch", "Backyard", "Sideyard", "Living Room"];
@@ -237,10 +260,13 @@ function expiryToMs(value) {
 // state (data repo: state.json)
 //   { stations: { [stationName]: { watermarkMs, devices: {
 //       [deviceName]: { cropPath, eventCount,
-//                       enumCursorStamp?, enumPendingMissing? } } } } }
+//                       enumCursorStamp?, enumPendingMissing? } } } },
+//     health?: { [deviceName]: { ... } } }
 //   enumCursorStamp (v3): newest stamp whose window position is fully
 //   scanned-or-captured; enumPendingMissing (v3): snapshots still owed in
 //   the open window (cursor, newest]. Both absent on pre-v3 state.
+//   health (v4.2): per-device contact health + dark-camera state +
+//   liveness classifications — see health.mjs for the shape and rules.
 // ---------------------------------------------------------------------------
 function loadState() {
     try {
@@ -265,6 +291,88 @@ function stationState(state, name) {
         devices: raw.devices && typeof raw.devices === "object" ? raw.devices : {},
     };
     return state.stations[name];
+}
+
+// ---------------------------------------------------------------------------
+// v4.2 health: alert markers for dark cameras.
+// A marker is one JSON file per dark device in the data repo's alerts/
+// dir, shaped like a bundle record so GG's review loop can surface it
+// with the same conventions as inbox bundles:
+//   alerts/dark-camera-<device-slug>.json
+//   { alertId, type: "dark-camera", station, device, raisedAt,
+//     raisedAtLocal, reason, consecutiveFailedContacts,
+//     consecutiveLatestInfoTimeouts, lastContactOkAt, lastContactFailAt,
+//     lastContactFailKind, lastEventStamp, liveness, source }
+// The review loop deletes the marker once surfaced; the sweep re-raises
+// at most once per 24h while the device stays dark (health.mjs throttle)
+// and removes the marker itself when the device recovers.
+// ---------------------------------------------------------------------------
+function darkMarkerPath(deviceName) {
+    return path.join(ALERTS_DIR, `dark-camera-${slugify(deviceName)}.json`);
+}
+
+function maybeRaiseDarkAlert({ state, stationName, deviceName, nowMs }) {
+    const h = deviceHealth(state, deviceName, stationName);
+    const { dark, reason } = evaluateDark(h, nowMs);
+    const nowIso = new Date(nowMs).toISOString();
+    if (!dark) {
+        if (h.dark) {
+            h.dark = false;
+            h.darkSince = null;
+            log(`HEALTH ${deviceName}: recovered — dark flag cleared`);
+        }
+        try {
+            fs.unlinkSync(darkMarkerPath(deviceName));
+        } catch {
+            /* no marker present */
+        }
+        return;
+    }
+    if (!h.dark) {
+        h.dark = true;
+        h.darkSince = nowIso;
+    }
+    const markerPath = darkMarkerPath(deviceName);
+    const markerExists = fs.existsSync(markerPath);
+    if (!shouldWriteMarker(h, nowMs, markerExists)) return;
+    fs.mkdirSync(ALERTS_DIR, { recursive: true });
+    const marker = {
+        alertId: `dark-camera-${slugify(deviceName)}`,
+        type: "dark-camera",
+        station: stationName,
+        device: deviceName,
+        raisedAt: nowIso,
+        raisedAtLocal: fmtLocal(nowMs),
+        reason,
+        consecutiveFailedContacts: h.consecutiveFailedContacts,
+        consecutiveLatestInfoTimeouts: h.consecutiveLatestInfoTimeouts,
+        lastContactOkAt: h.lastContactOkAt,
+        lastContactFailAt: h.lastContactFailAt,
+        lastContactFailKind: h.lastContactFailKind,
+        lastEventStamp: h.lastEventStamp,
+        liveness: h.lastLiveness,
+        source: "sweep-health",
+    };
+    fs.writeFileSync(markerPath, JSON.stringify(marker, null, 2));
+    h.darkAlertLastRaisedAt = nowIso;
+    log(`HEALTH ${deviceName}: DARK — alert marker written (${reason})`);
+}
+
+/**
+ * v4.2: apply one station-level contact outcome to every device on the
+ * station, then evaluate the dark rule per device. Called on each
+ * sweepStation exit path (connect failure, latest-info failure,
+ * latest-info success) so health is recorded even when the station
+ * fails before any device state is touched.
+ */
+function touchStationHealth({ state, stationName, deviceNames, outcome, nowMs, eventStamps = {} }) {
+    const nowIso = new Date(nowMs).toISOString();
+    for (const deviceName of deviceNames) {
+        const h = deviceHealth(state, deviceName, stationName);
+        if (outcome === "ok") recordContactOk(h, nowIso, eventStamps[deviceName] ?? null);
+        else recordContactFail(h, nowIso, outcome);
+        maybeRaiseDarkAlert({ state, stationName, deviceName, nowMs });
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -719,6 +827,14 @@ async function main() {
     log(`devices: ${devices.map((d) => `${d.getName()} (${d.getModel()})`).join(", ")}`);
 
     const deviceBySerial = new Map(devices.map((d) => [d.getSerial(), d]));
+    // v4.2 health: device names per station serial (a SoloCam station's
+    // device is itself; the doorbell hangs off the WifiBridge station)
+    const devicesByStationSerial = new Map();
+    for (const d of devices) {
+        const key = d.getStationSerial();
+        if (!devicesByStationSerial.has(key)) devicesByStationSerial.set(key, []);
+        devicesByStationSerial.get(key).push(d.getName());
+    }
     const state = loadState();
     fs.mkdirSync(INBOX_DIR, { recursive: true });
 
@@ -733,7 +849,12 @@ async function main() {
             log(`SWEEP station=${name} SKIP time budget (20 min) reached — remaining stations deferred to next run`);
             continue;
         }
-        const result = await sweepStation({ station, state, deviceBySerial }).catch((e) => ({
+        const result = await sweepStation({
+            station,
+            state,
+            deviceBySerial,
+            stationDevices: devicesByStationSerial.get(station.getSerial()) ?? [name],
+        }).catch((e) => ({
             ok: false,
             reason: shortErr(e),
         }));
@@ -760,17 +881,27 @@ async function main() {
 }
 
 // ---------------------------------------------------------------------------
-// sweep v3: bounded enumeration of missed event snapshots for one device.
-// Scans the device-local seconds (cursor, newestStamp) ascending, in
-// batches of ENUM_CONCURRENCY probes (ENUM_PROBE_TIMEOUT_MS miss cap —
-// nonexistent paths are answered with silence), bundling every hit until
-// `owed` snapshots are found, the window is exhausted, or a hard bound
-// (per-device probe cap / per-station enumeration budget / global sweep
-// budget) is hit. Progress persists into state after every batch via
-// devState (enumCursorStamp / enumPendingMissing), so a bounded-out sweep
-// resumes the same window next run instead of rescanning or skipping.
+// sweep v3 + v4.2: bounded enumeration of missed event snapshots for one
+// device. Scans the device-local seconds in the window (cursor,
+// newestStamp) in batches of ENUM_CONCURRENCY probes
+// (ENUM_PROBE_TIMEOUT_MS miss cap — nonexistent paths are answered with
+// silence), bundling every hit until `owed` snapshots are found, the
+// window is exhausted, or a hard bound (per-device probe cap /
+// per-station enumeration budget / global sweep budget) is hit.
+// Progress persists into state after every batch via devState
+// (enumCursorStamp / enumPendingMissing), so a bounded-out sweep resumes
+// the same window next run instead of rescanning or skipping.
+//
+// v4.2 CLUSTER-FIRST: missed events arrive in bursts, so before (and
+// while) the ascending cursor scan runs, the sweep probes ±5-minute
+// windows around the device's own recently captured stamps — the newest
+// event, the previously stored one, and every hit the scan itself finds.
+// The persisted cursor contract is unchanged: enumCursorStamp only ever
+// advances over CONTIGUOUSLY scanned territory (a stamp counts as
+// scanned once it has been probed, delivered, or found in the inbox);
+// cluster probes ahead of the frontier never move it by themselves.
 // ---------------------------------------------------------------------------
-async function enumerateMissing({ channel, stationName, deviceName, deviceObj, template, devState, newestStamp, owed, state, enumDeadline, clipCtx }) {
+async function enumerateMissing({ channel, stationName, deviceName, deviceObj, template, devState, newestStamp, owed, state, enumDeadline, clipCtx, anchorStamps = [] }) {
     const tStart = Date.now();
     const startCursor = devState.enumCursorStamp;
     let probed = 0;
@@ -784,8 +915,32 @@ async function enumerateMissing({ channel, stationName, deviceName, deviceObj, t
     let windowClosed = false;
     let aborted = false;
 
-    const deliver = async (bs, buf) => {
+    // v4.2 cluster-first bookkeeping
+    const scanned = new Set(); // probed | delivered | already-in-inbox stamps this run
+    const queued = new Set(); // stamps currently sitting in the priority queue
+    let priority = []; // cluster-window stamps to probe before ascending continues
+    let clusterProbed = 0;
+    let clusterFound = 0;
+    const enqueueCluster = (anchor) => {
+        if (!anchor) return;
+        for (const s of clusterWindowStamps(anchor, startCursor, newestStamp)) {
+            if (!scanned.has(s) && !queued.has(s)) {
+                queued.add(s);
+                priority.push(s);
+            }
+        }
+        priority.sort();
+    };
+    for (const a of anchorStamps) enqueueCluster(a);
+    if (priority.length > 0) {
+        log(`${stationName}: ${deviceName}: ENUM cluster-first — ${priority.length} stamp(s) queued around ${[...new Set(anchorStamps.filter(Boolean))].join(", ") || "captured stamps"}`);
+    }
+
+    const deliver = async (bs, buf, viaCluster = false) => {
         found++;
+        if (viaCluster) clusterFound++;
+        scanned.add(bs);
+        enqueueCluster(bs); // a hit anchors its own burst neighbourhood
         const bundleName = `${slugify(stationName)}-${slugify(deviceName)}-${bs}`;
         const bundleDir = path.join(INBOX_DIR, bundleName);
         if (fs.existsSync(path.join(bundleDir, "record.json"))) return; // delivered by an earlier run
@@ -863,17 +1018,29 @@ async function enumerateMissing({ channel, stationName, deviceName, deviceObj, t
         saveState(state);
     };
 
-    while (stamp < newestStamp && found < owed) {
+    while (found < owed) {
         if (probed >= ENUM_MAX_PROBES_PER_DEVICE) break;
         if (Date.now() > enumDeadline || Date.now() - t0 > GLOBAL_STATION_BUDGET_MS) break;
         const want = Math.min(ENUM_CONCURRENCY, owed - found, ENUM_MAX_PROBES_PER_DEVICE - probed);
+
+        // assemble the batch: cluster-priority stamps first, then ascending
         const batchStamps = [];
-        let s = stamp;
-        while (batchStamps.length < want && s < newestStamp) {
+        const batchVia = new Map(); // stamp -> true when probed via the cluster queue
+        while (batchStamps.length < want && priority.length > 0) {
+            const s = priority.shift();
+            queued.delete(s);
+            if (scanned.has(s)) continue;
             batchStamps.push(s);
-            s = shiftStamp(s, 1);
+            batchVia.set(s, true);
         }
-        if (batchStamps.length === 0) break;
+        while (batchStamps.length < want && stamp < newestStamp) {
+            if (!scanned.has(stamp)) {
+                batchStamps.push(stamp);
+                batchVia.set(stamp, false);
+            }
+            stamp = shiftStamp(stamp, 1);
+        }
+        if (batchStamps.length === 0) break; // window exhausted (priority drained, ascending done)
 
         // a stamp whose bundle is already in the inbox counts as found
         // without spending a probe (state-loss insurance, mirrors v2)
@@ -882,6 +1049,9 @@ async function enumerateMissing({ channel, stationName, deviceName, deviceObj, t
             const bName = `${slugify(stationName)}-${slugify(deviceName)}-${bs}`;
             if (fs.existsSync(path.join(INBOX_DIR, bName, "record.json"))) {
                 found++;
+                if (batchVia.get(bs)) clusterFound++;
+                scanned.add(bs);
+                enqueueCluster(bs);
                 log(`${stationName}: ${deviceName}: ENUM ${bs} already in inbox — counted as found`);
             } else {
                 toProbe.push(bs);
@@ -892,6 +1062,7 @@ async function enumerateMissing({ channel, stationName, deviceName, deviceObj, t
         await Promise.all(
             toProbe.map(async (bs) => {
                 probed++;
+                if (batchVia.get(bs)) clusterProbed++;
                 try {
                     const buf = await channel.probeImage(buildEnumPath(template, bs));
                     outcomes.set(bs, { buf });
@@ -916,8 +1087,9 @@ async function enumerateMissing({ channel, stationName, deviceName, deviceObj, t
             const o = outcomes.get(bs);
             if (o?.buf) {
                 batchHits++;
-                await deliver(bs, o.buf);
+                await deliver(bs, o.buf, batchVia.get(bs) ?? false);
             } else if (o?.timeout) {
+                scanned.add(bs); // probed, silence = miss (v3 cursor semantics)
                 batchTimeouts.push(bs);
             }
         }
@@ -927,9 +1099,10 @@ async function enumerateMissing({ channel, stationName, deviceName, deviceObj, t
             for (const bs of batchTimeouts) {
                 if (found >= owed || probed >= ENUM_MAX_PROBES_PER_DEVICE) break;
                 probed++;
+                if (batchVia.get(bs)) clusterProbed++;
                 try {
                     const buf = await channel.probeImage(buildEnumPath(template, bs));
-                    await deliver(bs, buf);
+                    await deliver(bs, buf, batchVia.get(bs) ?? false);
                     log(`${stationName}: ${deviceName}: ENUM ${bs} hit on sequential re-probe`);
                 } catch {
                     /* true miss */
@@ -937,12 +1110,12 @@ async function enumerateMissing({ channel, stationName, deviceName, deviceObj, t
             }
         }
 
-        cursor = batchStamps[batchStamps.length - 1];
-        stamp = shiftStamp(cursor, 1);
+        // the persisted cursor advances only over contiguously scanned stamps
+        while (scanned.has(shiftStamp(cursor, 1))) cursor = shiftStamp(cursor, 1);
         persist();
     }
 
-    if (!aborted && (found >= owed || stamp >= newestStamp)) {
+    if (!aborted && (found >= owed || (stamp >= newestStamp && priority.length === 0))) {
         windowClosed = true;
         if (found < owed) {
             log(
@@ -957,12 +1130,13 @@ async function enumerateMissing({ channel, stationName, deviceName, deviceObj, t
     saveState(state);
     log(
         `${stationName}: ${deviceName}: ENUM window ${shiftStamp(startCursor, 1)}..${newestStamp} probed=${probed} found=${found} of owed=${owed} ` +
+            `(cluster probed=${clusterProbed} found=${clusterFound}) ` +
             `elapsed=${((Date.now() - tStart) / 1000).toFixed(1)}s${windowClosed ? " (window closed)" : ` (bounds hit — resumes from ${cursor} next sweep)`}`,
     );
     return { bundles, thumbs: thumbsAdded, clips: clipsAdded, maxEventMs };
 }
 
-async function sweepStation({ station, state, deviceBySerial }) {
+async function sweepStation({ station, state, deviceBySerial, stationDevices = [] }) {
     const name = station.getName();
     const stState = stationState(state, name);
 
@@ -977,7 +1151,12 @@ async function sweepStation({ station, state, deviceBySerial }) {
         }
         await sleep(CONNECT_SETTLE_MS);
         conn = await ensureP2PConnected(station, CONNECT_TIMEOUT_MS);
-        if (!conn.connected) return { ok: false, reason: `P2P connect failed: ${conn.error ?? "unknown"}` };
+        if (!conn.connected) {
+            // v4.2 health: a failed contact for every device on this station
+            touchStationHealth({ state, stationName: name, deviceNames: stationDevices, outcome: "p2p-connect", nowMs: Date.now() });
+            saveState(state);
+            return { ok: false, reason: `P2P connect failed: ${conn.error ?? "unknown"}` };
+        }
     }
     log(`${name}: P2P connected`);
 
@@ -987,9 +1166,25 @@ async function sweepStation({ station, state, deviceBySerial }) {
     try {
         latest = await channel.latestInfo();
     } catch (e) {
+        // v4.2 health: timeouts and other latest-info failures are failed contacts
+        const kind = isTimeoutErr(e) ? "latest-info-timeout" : "latest-info-error";
+        touchStationHealth({ state, stationName: name, deviceNames: stationDevices, outcome: kind, nowMs: Date.now() });
+        saveState(state);
         return { ok: false, reason: `latest-info failed: ${shortErr(e)}` };
     }
     log(`${name}: latest-info answered for ${latest.length} device(s)`);
+    // v4.2 health: the station was reached AND latest-info answered — a
+    // successful contact for all its devices; newest event stamps ride along
+    {
+        const eventStamps = {};
+        for (const entry of latest) {
+            const dName = entry.device_sn ? deviceBySerial.get(entry.device_sn)?.getName() : null;
+            const s = parsePathStamp(entry.crop_local_path || entry.crop_cloud_path || null);
+            if (dName && s) eventStamps[dName] = s;
+        }
+        touchStationHealth({ state, stationName: name, deviceNames: stationDevices, outcome: "ok", nowMs: Date.now(), eventStamps });
+        saveState(state);
+    }
     const enumDeadline = Date.now() + ENUM_STATION_BUDGET_MS;
 
     let newCount = 0;
@@ -1143,6 +1338,9 @@ async function sweepStation({ station, state, deviceBySerial }) {
                     owed,
                     state,
                     enumDeadline,
+                    // v4.2 cluster-first anchors: this device's own most
+                    // recently captured stamps (previous stored + newest)
+                    anchorStamps: [parsePathStamp(storedDev?.cropPath ?? null), newestStamp],
                     clipCtx: {
                         deviceSN: entry.device_sn,
                         cipherId: CIPHER_BY_STATION[name] ?? null,

@@ -1,0 +1,124 @@
+name: liveness
+
+# Eufy livestream liveness probes (Stage 2): for cameras that have been
+# event-quiet for >24h, open the live feed for ~5s and classify them
+# LIVE-QUIET / UNREACHABLE / DISABLED, recording the result in the data
+# repo's state.json health records. Battery discipline (≤ ~2 probes per
+# camera per day) is enforced inside app/liveness.mjs, so extra triggers
+# are harmless no-ops. A piggyback job in relay.yml also runs the probe
+# in auto mode after each sweep.
+#
+# This repo contains code + workflow only: no secrets, no session data,
+# no state, no camera media. Probe frames are uploaded as short-lived
+# artifacts; the only frame committed to the data repo is a camera's
+# first-look frame under health-frames/ (see app/liveness.mjs).
+
+on:
+  schedule:
+    - cron: "23 6,18 * * *" # twice daily; the in-script due-check enforces the real cadence
+  workflow_dispatch:
+    inputs:
+      targets:
+        description: "Comma-separated device names to force-probe (blank = auto: event-quiet + due)"
+        required: false
+        default: ""
+
+concurrency:
+  group: eufy-sweep # shared with relay.yml — never overlap a sweep run
+  cancel-in-progress: false
+
+permissions:
+  contents: read # the data-repo push goes over SSH (deploy key), not this token
+
+jobs:
+  liveness:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: vendor/eufy-security-client/package-lock.json
+
+      - name: Ensure ffmpeg (frame decoding)
+        run: |
+          if ! command -v ffmpeg >/dev/null 2>&1; then
+            sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+          fi
+          ffmpeg -version | head -1
+
+      - name: Materialize stored session (secret, never printed)
+        env:
+          EUFY_PERSISTENT_JSON: ${{ secrets.EUFY_PERSISTENT_JSON }}
+        run: |
+          umask 077
+          mkdir -p app/persistent-data
+          printf '%s' "$EUFY_PERSISTENT_JSON" > app/persistent-data/persistent.json
+
+      - name: Checkout data repo (SSH deploy key)
+        uses: actions/checkout@v4
+        with:
+          repository: suvamsh/eufy-relay-data
+          ssh-key: ${{ secrets.DATA_DEPLOY_KEY }}
+          path: data
+
+      - name: Install vendored client dependencies
+        working-directory: vendor/eufy-security-client
+        run: npm ci --no-audit --no-fund
+
+      - name: Run liveness probes
+        env:
+          EUFY_USERNAME: ${{ secrets.EUFY_USERNAME }}
+          RELAY_DATA_DIR: ${{ github.workspace }}/data
+          LIVENESS_SCRATCH_DIR: ${{ github.workspace }}/liveness-frames
+          LIVENESS_TARGETS: ${{ inputs.targets }}
+        run: |
+          set -o pipefail
+          node app/liveness.mjs 2>&1 | tee liveness.log
+
+      - name: Upload probe log + frames
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: liveness-results
+          path: |
+            liveness.log
+            liveness-frames/
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Commit + push data repo (only if anything changed)
+        if: success()
+        env:
+          DATA_DEPLOY_KEY: ${{ secrets.DATA_DEPLOY_KEY }}
+        run: |
+          umask 077
+          mkdir -p ~/.ssh
+          printf '%s\n' "$DATA_DEPLOY_KEY" > ~/.ssh/data_deploy_key
+          chmod 600 ~/.ssh/data_deploy_key
+          export GIT_SSH_COMMAND="ssh -i ~/.ssh/data_deploy_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
+          cd data
+          git config user.name "eufy-relay"
+          git config user.email "eufy-relay@localhost"
+          if [ -z "$(git status --porcelain)" ]; then
+            echo "relay-data: no changes to commit"
+            exit 0
+          fi
+          git add -A
+          git commit -m "liveness $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          # the sweep may have pushed since checkout — rebase-retry a few times
+          for i in 1 2 3; do
+            if git push origin HEAD; then
+              echo "relay-data: pushed $(git rev-parse --short HEAD)"
+              exit 0
+            fi
+            echo "push rejected (attempt $i) — fetching + rebasing"
+            git fetch origin && git rebase origin/main || git rebase --abort
+          done
+          echo "relay-data: push failed after retries"
+          exit 1
