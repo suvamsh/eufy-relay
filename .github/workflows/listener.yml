@@ -83,6 +83,12 @@ jobs:
           git -C data config user.name "eufy-relay"
           git -C data config user.email "eufy-relay@localhost"
 
+      - name: Resolve canonical session (data repo first, secret fallback)
+        env:
+          EUFY_PERSISTENT_JSON: ${{ secrets.EUFY_PERSISTENT_JSON }}
+          RELAY_DATA_DIR: ${{ github.workspace }}/data
+        run: node app/session-restore.mjs
+
       - name: Install vendored client dependencies
         working-directory: vendor/eufy-security-client
         run: npm ci --no-audit --no-fund

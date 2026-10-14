@@ -1,0 +1,103 @@
+name: session-keeper
+
+# Session keeper (Session permanence, Oct 13, 2026): the fleet's single
+# session writer. Every 6 hours (and on dispatch) it restores the best
+# session copy — data-repo canonical copy first, the EUFY_PERSISTENT_JSON
+# bootstrap secret second — verifies it online, seeds the canonical copy
+# into the private data repo (session/persistent.json) when missing, and
+# renews by a full guest login BEFORE expiry (<72h margin) when the
+# EUFY_GUEST_PASSWORD secret is configured. Without that secret it
+# verifies and reports only; a needed renewal then surfaces as
+# "SESSION KEEPER: FAIL ... no password secret" for the blocker flow.
+# A renewal login answered with a 2FA/captcha challenge prints
+# "SESSION KEEPER: CHALLENGE <kind>" and persists nothing.
+# Modes (dispatch input): auto | prove (data-repo copy only, secret
+# unused, verify only) | force-login (renew now; needs the password
+# secret).
+# This repo contains code + workflow only: no secrets, no session data,
+# no state, no camera media. Session files move only inside the runner
+# and into the PRIVATE data repo over the SSH deploy key.
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Keeper mode: auto | prove | force-login"
+        required: false
+        default: "auto"
+  schedule:
+    - cron: "17 */6 * * *"
+
+concurrency:
+  group: eufy-session-keeper
+  cancel-in-progress: false
+
+permissions:
+  contents: read # the data-repo push goes over SSH (deploy key), not this token
+
+jobs:
+  keep:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: vendor/eufy-security-client/package-lock.json
+
+      - name: Materialize bootstrap session (secret, never printed)
+        env:
+          EUFY_PERSISTENT_JSON: ${{ secrets.EUFY_PERSISTENT_JSON }}
+        run: |
+          umask 077
+          mkdir -p app/persistent-data
+          printf '%s' "$EUFY_PERSISTENT_JSON" > app/persistent-data/persistent.json
+
+      - name: Materialize data-repo deploy key
+        env:
+          DATA_DEPLOY_KEY: ${{ secrets.DATA_DEPLOY_KEY }}
+        run: |
+          umask 077
+          mkdir -p ~/.ssh
+          printf '%s\n' "$DATA_DEPLOY_KEY" > ~/.ssh/data_deploy_key
+          chmod 600 ~/.ssh/data_deploy_key
+
+      - name: Checkout data repo (SSH deploy key)
+        uses: actions/checkout@v4
+        with:
+          repository: suvamsh/eufy-relay-data
+          ssh-key: ${{ secrets.DATA_DEPLOY_KEY }}
+          path: data
+
+      - name: Configure data repo git identity
+        run: |
+          git -C data config user.name "eufy-relay"
+          git -C data config user.email "eufy-relay@localhost"
+
+      - name: Install vendored client dependencies
+        working-directory: vendor/eufy-security-client
+        run: npm ci --no-audit --no-fund
+
+      - name: Run session keeper
+        env:
+          EUFY_USERNAME: ${{ secrets.EUFY_USERNAME }}
+          EUFY_GUEST_PASSWORD: ${{ secrets.EUFY_GUEST_PASSWORD }}
+          RELAY_DATA_DIR: ${{ github.workspace }}/data
+          DATA_SSH_KEY_FILE: /home/runner/.ssh/data_deploy_key
+          SESSION_KEEPER_MODE: ${{ inputs.mode || 'auto' }}
+        run: |
+          set -o pipefail
+          node app/session-keeper.mjs 2>&1 | tee keeper.log
+
+      - name: Upload keeper log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: keeper-log
+          path: keeper.log
+          if-no-files-found: warn

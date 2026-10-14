@@ -49,6 +49,12 @@ jobs:
           ssh-key: ${{ secrets.DATA_DEPLOY_KEY }}
           path: data
 
+      - name: Resolve canonical session (data repo first, secret fallback)
+        env:
+          EUFY_PERSISTENT_JSON: ${{ secrets.EUFY_PERSISTENT_JSON }}
+          RELAY_DATA_DIR: ${{ github.workspace }}/data
+        run: node app/session-restore.mjs
+
       - name: Install vendored client dependencies
         working-directory: vendor/eufy-security-client
         run: npm ci --no-audit --no-fund
@@ -148,6 +154,12 @@ jobs:
           repository: suvamsh/eufy-relay-data
           ssh-key: ${{ secrets.DATA_DEPLOY_KEY }}
           path: data
+
+      - name: Resolve canonical session (data repo first, secret fallback)
+        env:
+          EUFY_PERSISTENT_JSON: ${{ secrets.EUFY_PERSISTENT_JSON }}
+          RELAY_DATA_DIR: ${{ github.workspace }}/data
+        run: node app/session-restore.mjs
 
       - name: Install vendored client dependencies
         working-directory: vendor/eufy-security-client
