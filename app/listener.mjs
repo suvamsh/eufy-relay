@@ -89,6 +89,7 @@ const CHAIN_ENABLED = process.env.LISTENER_CHAIN !== "false";
 const CHAIN_LEAD_MS = 15 * 60_000; // dispatch the successor this long before the window ends
 const HEARTBEAT_SYNC_MS = 5 * 60_000; // heartbeat commit cadence (dead-man threshold is ~30 min)
 const PUSH_DOWN_LIMIT_MS = 10 * 60_000; // push down this long -> end link early, chain a fresh one
+const PUSH_REREGISTER_MS = 20 * 60_000; // heal a stolen push registration (see reregisterPush)
 const CONNECT_TIMEOUT_MS = 90_000;
 const CONNECT_SETTLE_MS = 20_000;
 const IMAGE_TIMEOUT_MS = 30_000;
@@ -308,6 +309,7 @@ const heartbeat = {
     pushesHandled: 0,
     pushesSkipped: 0,
     bundlesWritten: 0,
+    pushReregistrations: 0,
     lastEvent: null, // { device, stamp, at }
     sessionExpiresAt: null,
     sessionOk: true,
@@ -850,6 +852,62 @@ async function handlePush(m) {
 // ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
+/**
+ * Re-register this link's push token with Eufy cloud.
+ *
+ * Why: the account's push routing follows the MOST RECENT token
+ * registration. In the vendored client, every cloud connect runs
+ * registerPushNotifications -> PushNotificationService.open() ->
+ * _open(false, true): fresh FCM credentials are force-minted and
+ * eufysecurity binds the new token account-wide (registerPushToken,
+ * legacy + mega backends). Any other process that connects with this
+ * session therefore steals routing into itself, and when it exits the
+ * pushes go to a dead token while this link's own socket stays up —
+ * the zero-push failure of Oct 13, 2026 (see RELAY-BUILD.md, Stage 1
+ * addendum). The relay's other jobs now run with EUFY_NO_PUSH=1
+ * (vendored push-ownership patch in eufysecurity.js), but a stray
+ * connect (a manual harness run, a future job) can still steal
+ * routing. Closing and reopening the push service mints a fresh
+ * token whose MCS connect re-runs the account binding, returning
+ * routing to this live link. Invoked on a timer from the hold loop.
+ */
+async function reregisterPush(reason) {
+    try {
+        const ps = client?.getPushService?.();
+        if (!ps) return false;
+        log(`push re-register (${reason}): closing the push service to mint a fresh token + account binding`);
+        try {
+            ps.close();
+        } catch {
+            /* ignore */
+        }
+        await sleep(3_000);
+        await ps.open();
+        const deadline = Date.now() + 45_000;
+        while (Date.now() < deadline) {
+            let connected = false;
+            try {
+                connected = Boolean(client.isPushConnected());
+            } catch {
+                /* keep waiting */
+            }
+            if (connected) {
+                heartbeat.pushReregistrations++;
+                heartbeat.pushConnected = true;
+                heartbeat.lastPushConnectedAt = new Date().toISOString();
+                log(`push re-register (${reason}): push reconnected — account routing re-bound to this link (total ${heartbeat.pushReregistrations})`);
+                return true;
+            }
+            await sleep(2_000);
+        }
+        log(`push re-register (${reason}): push did not reconnect within 45s — the push-down logic will chain a fresh link if it stays down`);
+        return false;
+    } catch (e) {
+        log(`push re-register (${reason}) failed: ${shortErr(e)}`);
+        return false;
+    }
+}
+
 let sessionFailed = false;
 const listenUntilMs = t0 + LISTEN_MINUTES * 60_000;
 const chainAtMs = listenUntilMs - CHAIN_LEAD_MS;
@@ -965,6 +1023,7 @@ async function main() {
 
     // ---- hold the link ----------------------------------------------------
     let lastHeartbeatSync = Date.now();
+    let lastReregister = Date.now();
     let pushDownSince = heartbeat.pushConnected ? null : Date.now();
     while (Date.now() < listenUntilMs) {
         await sleep(30_000);
@@ -986,8 +1045,12 @@ async function main() {
             lastHeartbeatSync = Date.now();
             await syncData(`listener heartbeat ${heartbeat.linkId}`);
             log(
-                `heartbeat: pushConnected=${heartbeat.pushConnected} received=${heartbeat.pushesReceived} handled=${heartbeat.pushesHandled} skipped=${heartbeat.pushesSkipped} bundles=${heartbeat.bundlesWritten}`,
+                `heartbeat: pushConnected=${heartbeat.pushConnected} received=${heartbeat.pushesReceived} handled=${heartbeat.pushesHandled} skipped=${heartbeat.pushesSkipped} bundles=${heartbeat.bundlesWritten} rereg=${heartbeat.pushReregistrations}`,
             );
+        }
+        if (Date.now() - lastReregister >= PUSH_REREGISTER_MS) {
+            lastReregister = Date.now();
+            await reregisterPush("periodic heal");
         }
         if (pushDownSince !== null && Date.now() - pushDownSince > PUSH_DOWN_LIMIT_MS) {
             heartbeat.state = "failed";

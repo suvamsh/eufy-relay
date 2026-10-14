@@ -74,6 +74,7 @@ jobs:
       - name: Run liveness probes
         env:
           EUFY_USERNAME: ${{ secrets.EUFY_USERNAME }}
+          EUFY_NO_PUSH: "1"
           RELAY_DATA_DIR: ${{ github.workspace }}/data
           LIVENESS_SCRATCH_DIR: ${{ github.workspace }}/liveness-frames
           LIVENESS_TARGETS: ${{ inputs.targets }}

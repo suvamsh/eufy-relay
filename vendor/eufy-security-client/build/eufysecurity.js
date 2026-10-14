@@ -884,6 +884,16 @@ class EufySecurity extends tiny_typed_emitter_1.TypedEmitter {
         return this.cameraMaxLivestreamSeconds;
     }
     async registerPushNotifications(credentials, persistentIds) {
+        // RELAY PUSH-OWNERSHIP PATCH (GG relay, Oct 13, 2026): push routing on
+        // this account follows the MOST RECENT token registration, and every
+        // cloud connect re-registers (open() force-mints fresh FCM credentials
+        // and binds the new token account-wide). Only the push listener may
+        // own that registration; every other relay job (sweep, liveness,
+        // away-state, away-watch) runs with EUFY_NO_PUSH=1 so its connects
+        // cannot steal routing into a process that exits minutes later.
+        // See RELAY-BUILD.md, Stage 1 addendum (zero-push diagnosis).
+        if (process.env.EUFY_NO_PUSH === "1")
+            return;
         if (credentials)
             this.pushService.setCredentials(credentials);
         if (persistentIds)

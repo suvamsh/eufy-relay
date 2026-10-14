@@ -120,6 +120,7 @@ jobs:
       - name: Run away-watch link
         env:
           EUFY_USERNAME: ${{ secrets.EUFY_USERNAME }}
+          EUFY_NO_PUSH: "1"
           RELAY_DATA_DIR: ${{ github.workspace }}/data
           DATA_SSH_KEY_FILE: /home/runner/.ssh/data_deploy_key
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

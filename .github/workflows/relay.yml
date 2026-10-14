@@ -56,6 +56,7 @@ jobs:
       - name: Run sweep
         env:
           EUFY_USERNAME: ${{ secrets.EUFY_USERNAME }}
+          EUFY_NO_PUSH: "1"
           RELAY_DATA_DIR: ${{ github.workspace }}/data
         run: |
           set -o pipefail
@@ -155,6 +156,7 @@ jobs:
       - name: Run liveness probes (auto mode)
         env:
           EUFY_USERNAME: ${{ secrets.EUFY_USERNAME }}
+          EUFY_NO_PUSH: "1"
           RELAY_DATA_DIR: ${{ github.workspace }}/data
           LIVENESS_SCRATCH_DIR: ${{ github.workspace }}/liveness-frames
         run: |
