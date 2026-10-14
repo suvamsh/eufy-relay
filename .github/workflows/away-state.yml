@@ -1,0 +1,91 @@
+name: away-state
+
+# Eufy away-state checker (security-guard program, Stage 5): reads the
+# Living Room camera's account-level enabled state — the away signal —
+# and writes away-state.json to the private data repo (suvamsh/eufy-relay-data)
+# over SSH with the write deploy key. When the state is ARMED and no
+# away-watch link is active, it also dispatches the watch chain.
+# GG's fast-lane judge dispatches this checker whenever away-state.json
+# goes stale; the schedule below is only a safety net (GitHub cron has
+# proven unreliable here). This repo contains code + workflow only:
+# no secrets, no session data, no state, no camera media.
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 */2 * * *"
+
+concurrency:
+  group: eufy-away-state
+  cancel-in-progress: false
+
+permissions:
+  contents: read # the data-repo push goes over SSH (deploy key), not this token
+  actions: write # arming: dispatch the away-watch chain when armed
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: vendor/eufy-security-client/package-lock.json
+
+      - name: Materialize stored session (secret, never printed)
+        env:
+          EUFY_PERSISTENT_JSON: ${{ secrets.EUFY_PERSISTENT_JSON }}
+        run: |
+          umask 077
+          mkdir -p app/persistent-data
+          printf '%s' "$EUFY_PERSISTENT_JSON" > app/persistent-data/persistent.json
+
+      - name: Materialize data-repo deploy key (for the checker's git pushes)
+        env:
+          DATA_DEPLOY_KEY: ${{ secrets.DATA_DEPLOY_KEY }}
+        run: |
+          umask 077
+          mkdir -p ~/.ssh
+          printf '%s\n' "$DATA_DEPLOY_KEY" > ~/.ssh/data_deploy_key
+          chmod 600 ~/.ssh/data_deploy_key
+
+      - name: Checkout data repo (SSH deploy key)
+        uses: actions/checkout@v4
+        with:
+          repository: suvamsh/eufy-relay-data
+          ssh-key: ${{ secrets.DATA_DEPLOY_KEY }}
+          path: data
+
+      - name: Configure data repo git identity
+        run: |
+          git -C data config user.name "eufy-relay"
+          git -C data config user.email "eufy-relay@localhost"
+
+      - name: Install vendored client dependencies
+        working-directory: vendor/eufy-security-client
+        run: npm ci --no-audit --no-fund
+
+      - name: Run away-state check
+        env:
+          EUFY_USERNAME: ${{ secrets.EUFY_USERNAME }}
+          RELAY_DATA_DIR: ${{ github.workspace }}/data
+          DATA_SSH_KEY_FILE: /home/runner/.ssh/data_deploy_key
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -o pipefail
+          node app/away-state.mjs 2>&1 | tee away-state.log
+
+      - name: Upload check log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: away-state-log
+          path: away-state.log
+          if-no-files-found: warn

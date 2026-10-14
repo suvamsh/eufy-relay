@@ -1,0 +1,1 @@
+{"dependencies":{"onnxruntime-node":"1.20.1"},"description":"Runner-side apps for the Eufy relay (sweep, listener, liveness, away-state, away-watch). Only away-watch needs an npm dependency (onnxruntime-node for the person detector); the rest import the vendored eufy-security-client by path.","name":"eufy-relay-app","private":true,"type":"module","version":"1.0.0"}

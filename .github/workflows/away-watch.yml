@@ -1,0 +1,136 @@
+name: away-watch
+
+# Eufy v2 away-mode indoor watch (security-guard program, Stage 5):
+# a long-lived job (one "link", ~5.5 h) that runs ONLY while the
+# Living Room camera is enabled (the away signal). While armed it holds
+# the camera's livestream on the runner, analyzes it continuously
+# (motion gate on every downscaled frame + SSD-MobileNet person
+# classifier — see app/person-detect.mjs), keeps a ~10 min full-res
+# ring buffer, and on a person-class trigger pushes a -30s/+30s
+# incident segment as a CRITICAL priority bundle to the private data
+# repo (suvamsh/eufy-relay-data) for GG's fast-lane judge. Links
+# self-chain while armed (workflow_dispatch; the concurrency group
+# holds the successor pending until this link exits) and exit without
+# chaining the moment the camera is disabled. The 6-hourly schedule is
+# only a safety net: a scheduled link that finds the camera disabled
+# exits within minutes having opened no stream. GG's fast-lane judge
+# is the dead-man's switch (heartbeat away-watch-state.json in the
+# data repo). This repo contains code + workflow only: no secrets, no
+# session data, no state, no camera media (the detector model is
+# downloaded from the ONNX Model Zoo at setup and cached, never
+# committed).
+
+on:
+  workflow_dispatch:
+    inputs:
+      watch_minutes:
+        description: "Watch window for this link (minutes)"
+        required: false
+        default: "320"
+      chain:
+        description: "Dispatch a successor link before this one ends (only while armed)"
+        type: boolean
+        required: false
+        default: true
+  schedule:
+    - cron: "41 */6 * * *"
+
+concurrency:
+  group: eufy-away-watch
+  cancel-in-progress: false
+
+permissions:
+  contents: read # the data-repo push goes over SSH (deploy key), not this token
+  actions: write # self-chaining: a link dispatches its successor
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: vendor/eufy-security-client/package-lock.json
+
+      - name: Materialize stored session (secret, never printed)
+        env:
+          EUFY_PERSISTENT_JSON: ${{ secrets.EUFY_PERSISTENT_JSON }}
+        run: |
+          umask 077
+          mkdir -p app/persistent-data
+          printf '%s' "$EUFY_PERSISTENT_JSON" > app/persistent-data/persistent.json
+
+      - name: Materialize data-repo deploy key (for the watch's git pushes)
+        env:
+          DATA_DEPLOY_KEY: ${{ secrets.DATA_DEPLOY_KEY }}
+        run: |
+          umask 077
+          mkdir -p ~/.ssh
+          printf '%s\n' "$DATA_DEPLOY_KEY" > ~/.ssh/data_deploy_key
+          chmod 600 ~/.ssh/data_deploy_key
+
+      - name: Checkout data repo (SSH deploy key)
+        uses: actions/checkout@v4
+        with:
+          repository: suvamsh/eufy-relay-data
+          ssh-key: ${{ secrets.DATA_DEPLOY_KEY }}
+          path: data
+
+      - name: Configure data repo git identity
+        run: |
+          git -C data config user.name "eufy-relay"
+          git -C data config user.email "eufy-relay@localhost"
+
+      - name: Install vendored client dependencies
+        working-directory: vendor/eufy-security-client
+        run: npm ci --no-audit --no-fund
+
+      - name: Install app dependencies (onnxruntime-node for the detector)
+        working-directory: app
+        run: npm ci --no-audit --no-fund
+
+      - name: Cache detector model
+        uses: actions/cache@v4
+        with:
+          path: app/models
+          key: ssd-mobilenet-v1-12-b8fba5e4
+
+      - name: Fetch detector model (ONNX Model Zoo, sha256-verified)
+        run: |
+          mkdir -p app/models
+          if [ ! -f app/models/ssd_mobilenet_v1_12.onnx ]; then
+            curl -sfL --retry 3 -o app/models/ssd_mobilenet_v1_12.onnx \
+              "https://media.githubusercontent.com/media/onnx/models/main/validated/vision/object_detection_segmentation/ssd-mobilenetv1/model/ssd_mobilenet_v1_12.onnx"
+          fi
+          echo "b8fba5e404077d4048d27fcd1667e85e27e192eb9bf51e696c46a3acd7d21058  app/models/ssd_mobilenet_v1_12.onnx" | sha256sum -c -
+
+      - name: Verify ffmpeg
+        run: ffmpeg -version | head -1
+
+      - name: Run away-watch link
+        env:
+          EUFY_USERNAME: ${{ secrets.EUFY_USERNAME }}
+          RELAY_DATA_DIR: ${{ github.workspace }}/data
+          DATA_SSH_KEY_FILE: /home/runner/.ssh/data_deploy_key
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          WATCH_MINUTES: ${{ inputs.watch_minutes || '320' }}
+          AWAY_WATCH_CHAIN: ${{ inputs.chain }}
+          AWAY_WATCH_MODEL: ${{ github.workspace }}/app/models/ssd_mobilenet_v1_12.onnx
+        run: |
+          set -o pipefail
+          node app/away-watch.mjs 2>&1 | tee away-watch.log
+
+      - name: Upload watch log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: away-watch-log
+          path: away-watch.log
+          if-no-files-found: warn
