@@ -235,8 +235,8 @@ function lastEventStampFor(state, deviceName) {
 
 async function probeDevice({ state, device, stationsBySerial }) {
     const name = device.getName();
-    const nowIso = new Date().toISOString();
-    const h = deviceHealth(state, name, null);
+    const stationForHealth = stationsBySerial.get(device.getStationSerial());
+    const h = deviceHealth(state, name, stationForHealth?.getName() ?? null);
     const finish = (classification, failurePattern, bytes = 0) => {
         recordLiveness(h, new Date().toISOString(), { classification, failurePattern, bytes });
         log(`LIVENESS device=${name} classification=${classification}${failurePattern ? ` pattern=${failurePattern}` : ""} bytes=${bytes}`);
@@ -284,9 +284,12 @@ async function probeDevice({ state, device, stationsBySerial }) {
     if (!dec.ok) return finish("UNREACHABLE", "stream-undecodable", res.video.length);
     log(`LIVENESS device=${name}: frame decoded (${dec.codec} ${dec.width ?? "?"}x${dec.height ?? "?"}) → ${path.basename(dec.framePath)}`);
 
-    // retain the frame in the data repo ONLY as a device's first-look evidence
+    // Retain the frame in the data repo ONLY as first-look evidence for a
+    // camera that has never recorded an event (Backyard/Sideyard today) —
+    // cameras with event history already leave snapshots in the bundle
+    // flow, and their probe frames stay scratch/artifact-only.
     const retained = path.join(FRAMES_DIR, `${slugify(name)}.jpg`);
-    if (!fs.existsSync(retained)) {
+    if (!lastEventStampFor(state, name) && !fs.existsSync(retained)) {
         fs.mkdirSync(FRAMES_DIR, { recursive: true });
         fs.copyFileSync(dec.framePath, retained);
         log(`LIVENESS device=${name}: first-look frame retained at health-frames/${slugify(name)}.jpg`);
