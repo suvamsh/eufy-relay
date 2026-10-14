@@ -1023,16 +1023,24 @@ async function enumerateMissing({ channel, stationName, deviceName, deviceObj, t
         if (Date.now() > enumDeadline || Date.now() - t0 > GLOBAL_STATION_BUDGET_MS) break;
         const want = Math.min(ENUM_CONCURRENCY, owed - found, ENUM_MAX_PROBES_PER_DEVICE - probed);
 
-        // assemble the batch: cluster-priority stamps first, then ascending
+        // Assemble the batch: cluster-priority stamps and the ascending
+        // scan SHARE each batch (cluster takes at most half, rounded up)
+        // so burst windows drain first-ish while the contiguous cursor
+        // frontier keeps moving — a hit-fed cluster queue must not starve
+        // the ascending pass for a whole station budget. Once the
+        // ascending scan is exhausted the cluster queue takes full batches.
         const batchStamps = [];
         const batchVia = new Map(); // stamp -> true when probed via the cluster queue
-        while (batchStamps.length < want && priority.length > 0) {
-            const s = priority.shift();
-            queued.delete(s);
-            if (scanned.has(s)) continue;
-            batchStamps.push(s);
-            batchVia.set(s, true);
-        }
+        const takeCluster = (cap) => {
+            while (batchStamps.length < cap && priority.length > 0) {
+                const s = priority.shift();
+                queued.delete(s);
+                if (scanned.has(s)) continue;
+                batchStamps.push(s);
+                batchVia.set(s, true);
+            }
+        };
+        takeCluster(stamp >= newestStamp ? want : Math.ceil(want / 2));
         while (batchStamps.length < want && stamp < newestStamp) {
             if (!scanned.has(stamp)) {
                 batchStamps.push(stamp);
@@ -1040,6 +1048,7 @@ async function enumerateMissing({ channel, stationName, deviceName, deviceObj, t
             }
             stamp = shiftStamp(stamp, 1);
         }
+        takeCluster(want); // ascending exhausted → top up from the cluster queue
         if (batchStamps.length === 0) break; // window exhausted (priority drained, ascending done)
 
         // a stamp whose bundle is already in the inbox counts as found
