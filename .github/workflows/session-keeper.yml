@@ -85,6 +85,11 @@ jobs:
 
       - name: Run session keeper
         env:
+          # The keeper connects (verify + renewal login) but must NEVER
+          # register for push: registration is account-wide last-connect-
+          # wins, and the listener is the account's sole push registrant
+          # (see the relay push-ownership patch in build/eufysecurity.js).
+          EUFY_NO_PUSH: "1"
           EUFY_USERNAME: ${{ secrets.EUFY_USERNAME }}
           EUFY_GUEST_PASSWORD: ${{ secrets.EUFY_GUEST_PASSWORD }}
           RELAY_DATA_DIR: ${{ github.workspace }}/data
