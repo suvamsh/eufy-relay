@@ -20,6 +20,10 @@ on:
         description: "Optional known snapshot path for the image-download control (Porch only)"
         required: false
         default: ""
+      stream_early:
+        description: "1 = run the livestream-wake recipe immediately after the baseline ask"
+        required: false
+        default: ""
 
 concurrency:
   group: eufy-sweep
@@ -74,6 +78,7 @@ jobs:
           EUFY_NO_PUSH: "1"
           PROBE_TARGET: ${{ inputs.target }}
           PROBE_CONTROL_PATH: ${{ inputs.control_path }}
+          PROBE_STREAM_EARLY: ${{ inputs.stream_early }}
         run: |
           set -o pipefail
           node app/probe-latest-info.mjs 2>&1 | tee probe.log

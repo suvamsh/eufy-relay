@@ -228,6 +228,59 @@ async function main() {
         return;
     }
 
+    // ---- 1b. stream-first variant (PROBE_STREAM_EARLY=1): is the ----------
+    // livestream start itself the wake trigger? (Sideyard probe
+    // 38693266733 answered 205ms after a stream, following ~250s of
+    // dropped DB asks — ambiguous between time-based wake at ~250s and
+    // a stream-caused wake. This variant streams at ~50s to decide.)
+    if (process.env.PROBE_STREAM_EARLY === "1") {
+        const sn = device?.getSerial?.();
+        let bytes = 0;
+        let started = false;
+        if (sn) {
+            await new Promise((resolve) => {
+                let done = false;
+                const finish = () => {
+                    if (done) return;
+                    done = true;
+                    try {
+                        client.stopStationLivestream(sn).catch(() => {});
+                    } catch {
+                        /* ignore */
+                    }
+                    resolve();
+                };
+                const onStart = (st, dev, _m, videoStream, audioStream) => {
+                    if (st?.getSerial?.() !== station.getSerial() || dev?.getSerial?.() !== sn) {
+                        videoStream?.resume?.();
+                        audioStream?.resume?.();
+                        return;
+                    }
+                    started = true;
+                    videoStream?.on("data", (c) => {
+                        bytes += c.length;
+                    });
+                    videoStream?.on("error", () => {});
+                    audioStream?.resume?.();
+                    setTimeout(finish, 6_000);
+                };
+                client.on("station livestream start", onStart);
+                setTimeout(() => {
+                    client.off("station livestream start", onStart);
+                    finish();
+                }, 30_000);
+                Promise.resolve()
+                    .then(() => client.startStationLivestream(sn))
+                    .catch((e) => log(`  early livestream start threw: ${shortErr(e)}`));
+            });
+        }
+        note("earlyLivestream", started ? `STARTED bytes=${bytes}` : "NO START in 30s");
+        await sleep(3_000);
+        r = await asker.ask(45_000);
+        note("afterEarlyStream", r.ok ? `ANSWER latency=${r.latencyMs}ms` : `FAIL ${r.reason}`);
+        if (r.ok) return;
+    }
+
     // ---- 2. wait 60 s, ask again ---------------------------------------------
     log("recipe wait: idling 60s on the same connection…");
     await sleep(60_000);
