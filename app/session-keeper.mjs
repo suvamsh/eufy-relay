@@ -233,32 +233,45 @@ async function verifyWorkingCopy() {
 }
 
 /**
- * Seed transform for a renewal login: drop the stored mega (v6) session
- * so the client performs a GENUINE mega login instead of reusing it.
+ * Seed transform for a renewal login: drop BOTH stored sessions from
+ * the scratch seed so the client performs GENUINE logins on both
+ * backends instead of reusing whichever half happens to still be valid.
  *
- * Why (found Oct 15, 2026): MegaTransition.loginMega() early-returns
- * "ok" whenever the restored mega session is still valid
- * (hasValidSession()), without calling mega.login() or re-exporting the
- * session — so a forced keeper login renewed the legacy token (+30d)
- * but carried the mega session over byte-identical, leaving the fleet
- * headed for a mega lapse (2026-11-11) that classifySession counts as
- * "expired" for the WHOLE copy (restore gate rejects it; see
- * session-lib.mjs). The legacy half has no such skip: its load-time
- * login_hash gate had already invalidated its token in the seed.
- * Removing the `megaApi` key from the SCRATCH seed only (the canonical
- * copy is never touched) makes getMegaApi() find no saved session, so
- * loginMega() runs estimateDomain + keyExchange + mega.login() with the
- * keeper's password and exports a fresh ~30-day mega session. The
- * top-level identity fields (openudid, httpApi, legacy token) stay in
- * the seed, so Eufy still sees the same known device. If the mega login
- * draws a 2FA/captcha challenge, the existing challenge path persists
- * nothing — the fleet keeps the previous canonical copy.
+ * Why (found Oct 15, 2026): both client halves skip re-login while
+ * their stored session looks valid, each behind a different gate —
+ * MegaTransition.loginMega() early-returns "ok" when
+ * MegaHTTPApi.hasValidSession() is true (no mega.login(), no session
+ * re-export), and HTTPApi.login() skips its password POST while its
+ * token is present and unexpired. A keeper "renewal" therefore renews
+ * only the half whose gate happens to trip: the first armed
+ * force-login (run 38783559217) renewed legacy only — its token had
+ * been invalidated by the load-time login_hash gate after drifting
+ * through password-less fleet writes — and carried mega over
+ * byte-identical (still expiring 2026-11-11, mid Hawaii trip, a lapse
+ * classifySession counts as "expired" for the WHOLE copy: the restore
+ * gate would reject it despite a valid legacy token). Stripping mega
+ * alone then renewed mega only, because the first run had rewritten
+ * login_hash from the keeper's own password config, so the legacy gate
+ * no longer tripped (run 38784104881, caught by the renew() guard).
+ * Deleting `megaApi` + the legacy `cloud_token` /
+ * `cloud_token_expiration` / `httpApi` keys from the SCRATCH seed only
+ * (the canonical copy is never touched) leaves no reusable session on
+ * either backend: loginMega() runs estimateDomain + keyExchange +
+ * mega.login(), HTTPApi performs its login POST, and both tokens come
+ * back fresh ~30-day issues, exported into the scratch persistent.json.
+ * Identity fields (openudid, login_hash, serial_number, country) stay,
+ * so Eufy still sees the same known device. If either login draws a
+ * 2FA/captcha challenge, the existing challenge path persists nothing —
+ * the fleet keeps the previous canonical copy.
  */
-function stripMegaSession(seedText) {
+function stripStoredSessions(seedText) {
     try {
         const obj = JSON.parse(seedText);
-        if (obj && typeof obj === "object" && "megaApi" in obj) {
+        if (obj && typeof obj === "object") {
             delete obj.megaApi;
+            delete obj.cloud_token;
+            delete obj.cloud_token_expiration;
+            delete obj.httpApi;
             return JSON.stringify(obj);
         }
     } catch {
@@ -270,10 +283,10 @@ function stripMegaSession(seedText) {
 /**
  * Full renewal login in a scratch persistent dir seeded with the best
  * existing copy (carrying the client identity — openudid, keys — so
- * Eufy sees the same "device" it already knows), with the stored mega
- * session stripped (see stripMegaSession) so BOTH tokens are genuinely
- * re-issued. On success the scratch persistent.json is a fresh
- * validated copy; on challenge or failure NOTHING is persisted
+ * Eufy sees the same "device" it already knows), with both stored
+ * sessions stripped (see stripStoredSessions) so BOTH tokens are
+ * genuinely re-issued. On success the scratch persistent.json is a
+ * fresh validated copy; on challenge or failure NOTHING is persisted
  * anywhere.
  */
 async function renewalLogin(seedText) {
@@ -284,7 +297,7 @@ async function renewalLogin(seedText) {
     } catch {
         /* best effort */
     }
-    if (seedText) writeFileAtomic(path.join(SCRATCH_DIR, "persistent.json"), stripMegaSession(seedText));
+    if (seedText) writeFileAtomic(path.join(SCRATCH_DIR, "persistent.json"), stripStoredSessions(seedText));
 
     const password = process.env.EUFY_GUEST_PASSWORD;
     const client = await makeClient({ password, persistentDir: SCRATCH_DIR });
