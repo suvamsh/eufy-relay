@@ -1,13 +1,20 @@
-# Muse Security Guard
+# Meerkat
 
-Open-source camera guard for Muse: a GitHub Actions fleet that pulls
-Eufy camera event snapshots and full video clips from on-device storage,
-so a Muse agent can review them and alert only on events that actually
-matter, instead of Eufy's noisy motion-only notifications.
+Put your personal AI agent on guard duty for your home.
 
-Status: live and in active testing (first production deployment: October
-2026). This repository is the open-source core of Muse Security Guard
-and will be part of the MuseGuard installer.
+Meerkats live in a mob, and the mob always has a sentinel: one stands
+upright on watch while the others eat, play and live their lives, and
+it only calls out when something actually matters. That is exactly
+what Meerkat does with your home security cameras and the AI agent
+you already have (Muse, or any capable personal agent).
+
+A GitHub Actions fleet pulls Eufy camera event snapshots and full
+video clips from on-device storage, so your agent can review them
+and alert you only on events that actually matter, instead of the
+camera app's noisy motion-only notifications.
+
+Status: live and in active testing (first production deployment:
+October 2026). This repository is the open-source core of Meerkat.
 
 ## How it works
 
@@ -53,7 +60,7 @@ needs, outside this repo:
 
 ## Name history
 
-Renamed from `eufy-relay` to `muse-security-guard` on October 14, 2026.
+Renamed from `eufy-relay` to `muse-security-guard` on October 14, 2026, and to `meerkat` the same day. (Do not create repos under the old names: the redirects depend on them staying retired.)
 GitHub redirects the old URL. The private data repository keeps its
 internal name (`eufy-relay-data`) for now; the workflows reference it
 by that name.

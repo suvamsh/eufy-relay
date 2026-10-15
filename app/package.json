@@ -1,1 +1,10 @@
-{"dependencies": {"onnxruntime-node": "1.20.1"}, "description": "Runner-side apps for Muse Security Guard (sweep, listener, liveness, session-keeper, away-state, away-watch). Only away-watch needs an npm dependency (onnxruntime-node for the person detector); the rest import the vendored eufy-security-client by path.", "name": "muse-security-guard-app", "private": true, "type": "module", "version": "1.0.0"}
+{
+  "dependencies": {
+    "onnxruntime-node": "1.20.1"
+  },
+  "description": "Runner-side apps for Meerkat (sweep, listener, liveness, session-keeper, away-state, away-watch). Only away-watch needs an npm dependency (onnxruntime-node for the person detector); the rest import the vendored eufy-security-client by path.",
+  "name": "meerkat-app",
+  "private": true,
+  "type": "module",
+  "version": "1.0.0"
+}

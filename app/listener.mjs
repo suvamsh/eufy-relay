@@ -83,7 +83,7 @@ const INBOX_DIR = path.join(DATA_DIR, "inbox");
 const HEARTBEAT_FILE = path.join(DATA_DIR, "listener-state.json");
 const PUSH_LOG_FILE = path.join(DATA_DIR, "push-log.jsonl");
 const DEVICE_TZ = "America/Los_Angeles";
-const REPO = process.env.GH_REPO || "suvamsh/muse-security-guard";
+const REPO = process.env.GH_REPO || "suvamsh/meerkat";
 
 const LISTEN_MINUTES = Math.max(5, Number(process.env.LISTEN_MINUTES || 320) || 320);
 const CHAIN_ENABLED = process.env.LISTENER_CHAIN !== "false";

@@ -75,7 +75,7 @@ const HEARTBEAT_FILE = path.join(DATA_DIR, "away-watch-state.json");
 const AWAY_FILE = path.join(DATA_DIR, "away-state.json");
 const CAMERA_NAME = "Living Room";
 const DEVICE_TZ = "America/Los_Angeles";
-const REPO = process.env.GH_REPO || "suvamsh/muse-security-guard";
+const REPO = process.env.GH_REPO || "suvamsh/meerkat";
 const MODEL_PATH = process.env.AWAY_WATCH_MODEL || path.join(HERE, "models", "ssd_mobilenet_v1_12.onnx");
 const RING_DIR = process.env.AWAY_WATCH_RING_DIR || path.join(os.tmpdir(), "away-watch-ring");
 
