@@ -1,0 +1,186 @@
+name: exp-push
+
+# Push-delivery experiments (Oct 15, 2026 deep dive; see RELAY-BUILD.md
+# push addendum). Manual dispatch only. Two modes:
+#   e2 — two instrumented listeners (labels A/B) register simultaneously
+#        and log every push + every account-binding result for
+#        pair_minutes. Establishes whether Eufy's push binding is
+#        exclusive-to-newest or fan-out.
+#   e1 — one instrumented listener runs a baseline, then a keeper-style
+#        FULL LOGIN (the real session-keeper, mode=force-login,
+#        EUFY_NO_PUSH=1) is performed beside it, then observation
+#        continues across several 20-min re-register cycles. Tests
+#        whether a fleet full login deafens a live listener.
+# Experiment registrations disturb production push routing by design;
+# the operator restarts the production listener when a run finishes.
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Experiment: e1 (login interference) or e2 (dual registration)"
+        required: true
+        default: "e2"
+      baseline_minutes:
+        description: "e1: minutes of listening before the keeper login"
+        required: false
+        default: "30"
+      observe_minutes:
+        description: "e1: minutes of listening after the keeper login"
+        required: false
+        default: "70"
+      pair_minutes:
+        description: "e2: minutes each twin listens"
+        required: false
+        default: "50"
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  e2:
+    if: inputs.mode == 'e2'
+    strategy:
+      matrix:
+        label: [A, B]
+      fail-fast: false
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: vendor/eufy-security-client/package-lock.json
+      - name: Materialize stored session (secret, never printed)
+        env:
+          EUFY_PERSISTENT_JSON: ${{ secrets.EUFY_PERSISTENT_JSON }}
+        run: |
+          umask 077
+          mkdir -p app/persistent-data
+          printf '%s' "$EUFY_PERSISTENT_JSON" > app/persistent-data/persistent.json
+      - name: Materialize data-repo deploy key
+        env:
+          DATA_DEPLOY_KEY: ${{ secrets.DATA_DEPLOY_KEY }}
+        run: |
+          umask 077
+          mkdir -p ~/.ssh
+          printf '%s\n' "$DATA_DEPLOY_KEY" > ~/.ssh/data_deploy_key
+          chmod 600 ~/.ssh/data_deploy_key
+      - name: Checkout data repo (SSH deploy key)
+        uses: actions/checkout@v4
+        with:
+          repository: suvamsh/eufy-relay-data
+          ssh-key: ${{ secrets.DATA_DEPLOY_KEY }}
+          path: data
+      - name: Resolve canonical session (data repo first, secret fallback)
+        env:
+          EUFY_PERSISTENT_JSON: ${{ secrets.EUFY_PERSISTENT_JSON }}
+          RELAY_DATA_DIR: ${{ github.workspace }}/data
+        run: node app/session-restore.mjs
+      - name: Install vendored client dependencies
+        working-directory: vendor/eufy-security-client
+        run: npm ci --no-audit --no-fund
+      - name: Run experiment listener ${{ matrix.label }}
+        env:
+          EUFY_USERNAME: ${{ secrets.EUFY_USERNAME }}
+          EXP_LABEL: ${{ matrix.label }}
+          EXP_MINUTES: ${{ inputs.pair_minutes }}
+        run: |
+          set -o pipefail
+          node app/exp-push.mjs 2>&1 | tee exp-${{ matrix.label }}.log
+      - name: Upload experiment log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: exp-push-e2-${{ matrix.label }}
+          path: |
+            exp-${{ matrix.label }}.log
+            exp-log-${{ matrix.label }}.jsonl
+          if-no-files-found: warn
+
+  e1:
+    if: inputs.mode == 'e1'
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: vendor/eufy-security-client/package-lock.json
+      - name: Materialize stored session (secret, never printed)
+        env:
+          EUFY_PERSISTENT_JSON: ${{ secrets.EUFY_PERSISTENT_JSON }}
+        run: |
+          umask 077
+          mkdir -p app/persistent-data
+          printf '%s' "$EUFY_PERSISTENT_JSON" > app/persistent-data/persistent.json
+      - name: Materialize data-repo deploy key
+        env:
+          DATA_DEPLOY_KEY: ${{ secrets.DATA_DEPLOY_KEY }}
+        run: |
+          umask 077
+          mkdir -p ~/.ssh
+          printf '%s\n' "$DATA_DEPLOY_KEY" > ~/.ssh/data_deploy_key
+          chmod 600 ~/.ssh/data_deploy_key
+      - name: Checkout data repo (SSH deploy key)
+        uses: actions/checkout@v4
+        with:
+          repository: suvamsh/eufy-relay-data
+          ssh-key: ${{ secrets.DATA_DEPLOY_KEY }}
+          path: data
+      - name: Configure data repo git identity
+        run: |
+          git -C data config user.name "eufy-relay"
+          git -C data config user.email "eufy-relay@localhost"
+      - name: Resolve canonical session (data repo first, secret fallback)
+        env:
+          EUFY_PERSISTENT_JSON: ${{ secrets.EUFY_PERSISTENT_JSON }}
+          RELAY_DATA_DIR: ${{ github.workspace }}/data
+        run: node app/session-restore.mjs
+      - name: Snapshot pristine bootstrap session for the keeper step
+        run: cp app/persistent-data/persistent.json /tmp/pristine-persistent.json
+      - name: Install vendored client dependencies
+        working-directory: vendor/eufy-security-client
+        run: npm ci --no-audit --no-fund
+      - name: Baseline listen, then keeper full login, then observe
+        env:
+          EUFY_USERNAME: ${{ secrets.EUFY_USERNAME }}
+          EUFY_GUEST_PASSWORD: ${{ secrets.EUFY_GUEST_PASSWORD }}
+          RELAY_DATA_DIR: ${{ github.workspace }}/data
+          DATA_SSH_KEY_FILE: /home/runner/.ssh/data_deploy_key
+          BASELINE_MINUTES: ${{ inputs.baseline_minutes }}
+          OBSERVE_MINUTES: ${{ inputs.observe_minutes }}
+        run: |
+          set -o pipefail
+          TOTAL=$(( BASELINE_MINUTES + OBSERVE_MINUTES + 5 ))
+          EXP_LABEL=A EXP_MINUTES=$TOTAL node app/exp-push.mjs > exp-A.log 2>&1 &
+          EXP_PID=$!
+          echo "exp listener pid $EXP_PID; baseline ${BASELINE_MINUTES} min"
+          sleep $(( BASELINE_MINUTES * 60 ))
+          echo "=== E1 INTERFERENCE POINT: keeper force-login at $(date -u +%FT%TZ) ==="
+          cp /tmp/pristine-persistent.json app/persistent-data/persistent.json
+          SESSION_KEEPER_MODE=force-login EUFY_NO_PUSH=1 node app/session-keeper.mjs 2>&1 | tee keeper-e1.log || echo "keeper exited non-zero (see log)"
+          echo "=== keeper done at $(date -u +%FT%TZ); observing ${OBSERVE_MINUTES} min ==="
+          sleep $(( OBSERVE_MINUTES * 60 ))
+          kill $EXP_PID 2>/dev/null || true
+          sleep 3
+          cat exp-A.log
+      - name: Upload experiment logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: exp-push-e1
+          path: |
+            exp-A.log
+            exp-log-A.jsonl
+            keeper-e1.log
+          if-no-files-found: warn
