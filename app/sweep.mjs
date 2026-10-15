@@ -88,6 +88,10 @@
  * 3 s, and re-asks — a cold station now typically resolves in ~2 min
  * instead of riding asks out to the 270 s window. The plain ladder
  * remains as the fallback when the nudge cannot start a stream.
+ * Also in v4.4: ENUM_STATION_BUDGET_MS cut 8 min → 3 min — the two
+ * standing enumeration debts were burning 16 of the 20 global minutes
+ * every sweep and budget-skipping Sideyard/Living Room entirely (see
+ * the constant's comment and RELAY-BUILD.md "Dark cameras").
  *
  * V4.3 — WAKE LADDER FOR COLD CAMERA DATABASE SERVICES (Oct 15, 2026;
  * probe runs 38692543287 / 38692568670 / Sideyard probe, RELAY-BUILD.md
@@ -166,7 +170,15 @@ const STATION_GAP_MS = 5_000;
 const ENUM_PROBE_TIMEOUT_MS = 2_500; // exp-l: hits answer in <=0.8 s; a miss is silence — cap it short
 const ENUM_CONCURRENCY = 6; // probes in flight per station session
 const ENUM_MAX_PROBES_PER_DEVICE = 1_500; // hard probe budget per device per sweep
-const ENUM_STATION_BUDGET_MS = 8 * 60_000; // hard enumeration budget per station per sweep
+// v4.4: cut from 8 min to 3 min. Verification runs 38694149443 /
+// 38696440599 / 38698954749 / 38701398661 showed the two standing
+// enumeration debts (Front Door owed=1, Porch owed=7) burning their
+// full 480 s each, every sweep — 16 of the 20 global minutes — so
+// Sideyard and Living Room were budget-skipped sweep after sweep and
+// never got a contact at all. Enumeration is resumable by design
+// (v3), so a shorter slice only slows the backfill; contacts — the
+// health-critical path — now always fit: worst-case run ~15 min.
+const ENUM_STATION_BUDGET_MS = 3 * 60_000; // hard enumeration budget per station per sweep
 // sweep v4 clip fetching bounds
 const CLIP_MAX_PER_STATION = 15; // clip download attempts per station per sweep
 const CLIP_START_CAP_MS = 20_000; // no "download start" within 20 s = failed clip (silence semantics)
