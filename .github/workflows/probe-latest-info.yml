@@ -1,0 +1,87 @@
+name: probe-latest-info
+
+# Dark-camera experiment (Oct 15, 2026): controlled recipe ladder against
+# one SoloCam station to find what makes databaseQueryLatestInfo answer
+# again (see app/probe-latest-info.mjs). Dispatch-only, no schedule.
+# Shares the eufy-sweep concurrency group so it can never overlap a
+# production sweep's P2P sessions. Restores the session exactly like
+# production (app/session-restore.mjs). EUFY_NO_PUSH=1: the listener is
+# the fleet's only push registrant; this probe must never register.
+# Writes nothing to the data repo.
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "Station name to probe (Porch / Backyard / Sideyard)"
+        required: true
+        default: "Porch"
+      control_path:
+        description: "Optional known snapshot path for the image-download control (Porch only)"
+        required: false
+        default: ""
+
+concurrency:
+  group: eufy-sweep
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: vendor/eufy-security-client/package-lock.json
+
+      - name: Materialize stored session (secret, never printed)
+        env:
+          EUFY_PERSISTENT_JSON: ${{ secrets.EUFY_PERSISTENT_JSON }}
+        run: |
+          umask 077
+          mkdir -p app/persistent-data
+          printf '%s' "$EUFY_PERSISTENT_JSON" > app/persistent-data/persistent.json
+
+      - name: Checkout data repo (SSH deploy key)
+        uses: actions/checkout@v4
+        with:
+          repository: suvamsh/eufy-relay-data
+          ssh-key: ${{ secrets.DATA_DEPLOY_KEY }}
+          path: data
+
+      - name: Resolve canonical session (data repo first, secret fallback)
+        env:
+          EUFY_PERSISTENT_JSON: ${{ secrets.EUFY_PERSISTENT_JSON }}
+          RELAY_DATA_DIR: ${{ github.workspace }}/data
+        run: node app/session-restore.mjs
+
+      - name: Install vendored client dependencies
+        working-directory: vendor/eufy-security-client
+        run: npm ci --no-audit --no-fund
+
+      - name: Run probe
+        env:
+          EUFY_USERNAME: ${{ secrets.EUFY_USERNAME }}
+          EUFY_NO_PUSH: "1"
+          PROBE_TARGET: ${{ inputs.target }}
+          PROBE_CONTROL_PATH: ${{ inputs.control_path }}
+        run: |
+          set -o pipefail
+          node app/probe-latest-info.mjs 2>&1 | tee probe.log
+
+      - name: Upload probe log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: probe-log
+          path: probe.log
+          if-no-files-found: warn
