@@ -1,12 +1,16 @@
 #!/usr/bin/env node
 /**
  * latest-info.test.mjs — offline unit sanity for the v4.3 wake ladder
- * (no camera, no session). Run: node app/latest-info.test.mjs
+ * + v4.4 livestream wake nudge (no camera, no session).
+ * Run: node app/latest-info.test.mjs
  * A scripted fake ask + fake clock reproduce the probe transcripts:
  * warm camera (answers ask #1), classic camera (answers ask #2),
  * cold SoloCam (silent until a late ask), never-waking camera
- * (ladder exhausts and throws), budget-capped ladder, and a
- * non-timeout error aborting immediately.
+ * (ladder exhausts and throws), budget-capped ladder, a non-timeout
+ * error aborting immediately, and the v4.4 nudge cases (stream-early
+ * probe shape: nudge fires once after the classic pair, answer lands
+ * on ask #3 after a short 3 s settle; a failed/throwing nudge falls
+ * back to the plain ladder; warm cameras never nudge).
  */
 import assert from "node:assert";
 import { wakeLadderLatestInfo } from "./latest-info.mjs";
@@ -108,6 +112,83 @@ function harness(script) {
     await assert.rejects(() => wakeLadderLatestInfo(h.ask, h.opts), /returned code 3/);
     assert.equal(h.asks.length, 1, "no retry on a hard error");
     assert.deepEqual(h.sleeps, []);
+}
+
+// --- v4.4 nudge (stream-early probe shape): classic pair silent, nudge ------
+// fires once, ask #3 answers fast after a 3 s settle --------------------------
+{
+    const h = harness([{ type: "timeout" }, { type: "timeout" }, { type: "answer", latencyMs: 288 }]);
+    let nudgeCalls = 0;
+    const wakeNudge = async () => {
+        nudgeCalls++;
+        return true;
+    };
+    await wakeLadderLatestInfo(h.ask, { ...h.opts, wakeNudge });
+    assert.equal(nudgeCalls, 1, "nudge fired exactly once");
+    assert.deepEqual(h.asks, [45_000, 45_000, 30_000], "ask #3 follows the nudge");
+    assert.deepEqual(h.sleeps, [10_000, 3_000], "post-nudge settle is the short 3s, not 15s");
+}
+
+// --- v4.4: warm camera never nudges -------------------------------------------
+{
+    const h = harness([{ type: "answer", latencyMs: 500 }]);
+    let nudgeCalls = 0;
+    await wakeLadderLatestInfo(h.ask, {
+        ...h.opts,
+        wakeNudge: async () => {
+            nudgeCalls++;
+            return true;
+        },
+    });
+    assert.equal(nudgeCalls, 0, "no nudge when the first ask answers");
+    assert.deepEqual(h.asks, [45_000]);
+}
+
+// --- v4.4: nudge that does not engage falls back to the plain ladder ---------
+{
+    const h = harness([{ type: "timeout" }, { type: "timeout" }, { type: "timeout" }, { type: "answer", latencyMs: 900 }]);
+    let nudgeCalls = 0;
+    await wakeLadderLatestInfo(h.ask, {
+        ...h.opts,
+        wakeNudge: async () => {
+            nudgeCalls++;
+            return false;
+        },
+    });
+    assert.equal(nudgeCalls, 1, "nudge attempted once even when it cannot engage");
+    assert.deepEqual(h.sleeps, [10_000, 15_000, 15_000], "plain 15s settles resume after a failed nudge");
+    assert.equal(h.asks.length, 4);
+}
+
+// --- v4.4: a throwing nudge is swallowed, ladder continues --------------------
+{
+    const h = harness([{ type: "timeout" }, { type: "timeout" }, { type: "answer", latencyMs: 700 }]);
+    await wakeLadderLatestInfo(h.ask, {
+        ...h.opts,
+        wakeNudge: async () => {
+            throw new Error("stream start blew up");
+        },
+    });
+    assert.deepEqual(h.asks, [45_000, 45_000, 30_000], "ladder survived a throwing nudge");
+    assert.deepEqual(h.sleeps, [10_000, 15_000]);
+}
+
+// --- v4.4: hard error on ask #1 never reaches the nudge -----------------------
+{
+    const h = harness([{ type: "error", message: "latest-info returned code 3" }, { type: "answer" }]);
+    let nudgeCalls = 0;
+    await assert.rejects(
+        () =>
+            wakeLadderLatestInfo(h.ask, {
+                ...h.opts,
+                wakeNudge: async () => {
+                    nudgeCalls++;
+                    return true;
+                },
+            }),
+        /returned code 3/,
+    );
+    assert.equal(nudgeCalls, 0);
 }
 
 console.log("latest-info.test.mjs: all assertions passed");

@@ -36,9 +36,10 @@
  *
  * Battery discipline: one latest-info round per station per sweep (the
  * client also auto-queries latest-info on connect). Timeouts get the
- * v4.3 wake ladder (see latest-info.mjs): the classic retry, then
- * further asks on the same connection while a cold camera's database
- * service wakes — battery cameras routinely answer only on a later ask.
+ * v4.4 wake ladder (see latest-info.mjs): the classic retry, then a
+ * one-shot livestream wake nudge (a livestream start provably wakes a
+ * cold camera's database service), then further asks on the same
+ * connection if the nudge was not enough.
  *
  * V3 — BOUNDED PATH ENUMERATION (Experiment L, run 38358594501): the
  * SoloCam/indoor snapshot path is a pure function of the event's
@@ -75,6 +76,18 @@
  *     Livestream liveness classifications (app/liveness.mjs) ride in
  *     the same health record, so a dark alert can say whether the
  *     camera itself is alive-but-quiet, unreachable, or disabled.
+ *
+ * V4.4 — LIVESTREAM WAKE NUDGE (Oct 15, 2026; stream-early probe run
+ * 38693797658): the v4.3 ladder assumed the wake was purely time-based
+ * (100-250 s). The decisive probe showed it is not: Sideyard's
+ * baseline ask timed out cold, a ~6 s livestream ran at ~+54 s, and
+ * the next ask was answered in 288 ms at +64 s post-connect. A
+ * livestream start wakes the database service. The ladder now fires a
+ * one-shot wake nudge (StationChannel.wakeViaLivestream, self-hosted
+ * camera stations only) after the classic pair both time out, settles
+ * 3 s, and re-asks — a cold station now typically resolves in ~2 min
+ * instead of riding asks out to the 270 s window. The plain ladder
+ * remains as the fallback when the nudge cannot start a stream.
  *
  * V4.3 — WAKE LADDER FOR COLD CAMERA DATABASE SERVICES (Oct 15, 2026;
  * probe runs 38692543287 / 38692568670 / Sideyard probe, RELAY-BUILD.md
@@ -538,14 +551,78 @@ class StationChannel {
         return p;
     }
 
-    async latestInfo(wakeDeadlineMs = Number.POSITIVE_INFINITY) {
+    /**
+     * v4.4 wake nudge: start this station's own livestream briefly
+     * (~6 s once bytes flow, 30 s cap) and stop it again. Probe run
+     * 38693797658 proved a livestream start wakes a cold SoloCam's
+     * database service: the ask right after a ~6 s stream was answered
+     * in 288 ms at +64 s post-connect, where unaided asks had been
+     * dropped for 100-250 s. Mirrors the probe's stream handling
+     * exactly (serial-filtered, foreign streams drained). Resolves
+     * true only when a start for THIS station+device was observed.
+     * Never throws — the ladder treats false as "fall back to waiting".
+     */
+    async wakeViaLivestream(deviceSN) {
+        return new Promise((resolve) => {
+            let done = false;
+            let started = false;
+            const finish = () => {
+                if (done) return;
+                done = true;
+                try {
+                    this.client.stopStationLivestream(deviceSN).catch(() => {});
+                } catch {
+                    /* ignore */
+                }
+                resolve(started);
+            };
+            const onStart = (st, dev, _meta, videoStream, audioStream) => {
+                if (st?.getSerial?.() !== this.serial || dev?.getSerial?.() !== deviceSN) {
+                    try {
+                        videoStream?.resume?.();
+                    } catch {
+                        /* ignore */
+                    }
+                    try {
+                        audioStream?.resume?.();
+                    } catch {
+                        /* ignore */
+                    }
+                    return;
+                }
+                started = true;
+                videoStream?.on("data", () => {});
+                videoStream?.on("error", () => {});
+                try {
+                    audioStream?.resume?.();
+                } catch {
+                    /* ignore */
+                }
+                setTimeout(finish, 6_000);
+            };
+            this.client.on("station livestream start", onStart);
+            setTimeout(() => {
+                this.client.off("station livestream start", onStart);
+                finish();
+            }, 30_000);
+            Promise.resolve()
+                .then(() => this.client.startStationLivestream(deviceSN))
+                .catch((e) => log(`  ${this.name}: wake-nudge livestream start threw: ${shortErr(e)}`));
+        });
+    }
+
+    async latestInfo(wakeDeadlineMs = Number.POSITIVE_INFINITY, wakeDeviceSN = null) {
         // v4.3: the classic pair, then the wake ladder for cold SoloCam
         // database services (see latest-info.mjs for the probe evidence)
+        // v4.4: when the station IS a camera (its own device serial
+        // matches the station serial), the ladder's one-shot wake nudge
+        // is a brief livestream start on that device
         return wakeLadderLatestInfo((timeoutMs) => this.latestInfoOnce(timeoutMs), {
             deadlineMs: wakeDeadlineMs,
             sleep,
             log: (msg) => log(msg),
             label: this.name,
+            wakeNudge: wakeDeviceSN ? () => this.wakeViaLivestream(wakeDeviceSN) : undefined,
         });
     }
 
@@ -1193,7 +1270,14 @@ async function sweepStation({ station, state, deviceBySerial, stationDevices = [
         // v4.3 wake ladder cap: the global station budget minus a reserve
         // for the stations still to come (see latest-info.mjs)
         const wakeDeadlineMs = t0 + GLOBAL_STATION_BUDGET_MS - LATEST_WAKE_BUDGET_RESERVE_MS;
-        latest = await channel.latestInfo(wakeDeadlineMs);
+        // v4.4: the livestream wake nudge applies only when the station
+        // is itself a camera (SoloCam/indoor family: the device's serial
+        // equals the station's). Hub stations (WifiBridge + doorbell)
+        // get no nudge — the doorbell's database path never sleeps this
+        // way and its stream semantics differ.
+        const selfDevice = deviceBySerial.get(station.getSerial());
+        const wakeDeviceSN = selfDevice ? station.getSerial() : null;
+        latest = await channel.latestInfo(wakeDeadlineMs, wakeDeviceSN);
     } catch (e) {
         // v4.2 health: timeouts and other latest-info failures are failed contacts
         const kind = isTimeoutErr(e) ? "latest-info-timeout" : "latest-info-error";
