@@ -233,11 +233,48 @@ async function verifyWorkingCopy() {
 }
 
 /**
+ * Seed transform for a renewal login: drop the stored mega (v6) session
+ * so the client performs a GENUINE mega login instead of reusing it.
+ *
+ * Why (found Oct 15, 2026): MegaTransition.loginMega() early-returns
+ * "ok" whenever the restored mega session is still valid
+ * (hasValidSession()), without calling mega.login() or re-exporting the
+ * session — so a forced keeper login renewed the legacy token (+30d)
+ * but carried the mega session over byte-identical, leaving the fleet
+ * headed for a mega lapse (2026-11-11) that classifySession counts as
+ * "expired" for the WHOLE copy (restore gate rejects it; see
+ * session-lib.mjs). The legacy half has no such skip: its load-time
+ * login_hash gate had already invalidated its token in the seed.
+ * Removing the `megaApi` key from the SCRATCH seed only (the canonical
+ * copy is never touched) makes getMegaApi() find no saved session, so
+ * loginMega() runs estimateDomain + keyExchange + mega.login() with the
+ * keeper's password and exports a fresh ~30-day mega session. The
+ * top-level identity fields (openudid, httpApi, legacy token) stay in
+ * the seed, so Eufy still sees the same known device. If the mega login
+ * draws a 2FA/captcha challenge, the existing challenge path persists
+ * nothing — the fleet keeps the previous canonical copy.
+ */
+function stripMegaSession(seedText) {
+    try {
+        const obj = JSON.parse(seedText);
+        if (obj && typeof obj === "object" && "megaApi" in obj) {
+            delete obj.megaApi;
+            return JSON.stringify(obj);
+        }
+    } catch {
+        /* unparseable seed: return it untouched; shape validation downstream decides */
+    }
+    return seedText;
+}
+
+/**
  * Full renewal login in a scratch persistent dir seeded with the best
  * existing copy (carrying the client identity — openudid, keys — so
- * Eufy sees the same "device" it already knows). On success the
- * scratch persistent.json is a fresh validated copy; on challenge or
- * failure NOTHING is persisted anywhere.
+ * Eufy sees the same "device" it already knows), with the stored mega
+ * session stripped (see stripMegaSession) so BOTH tokens are genuinely
+ * re-issued. On success the scratch persistent.json is a fresh
+ * validated copy; on challenge or failure NOTHING is persisted
+ * anywhere.
  */
 async function renewalLogin(seedText) {
     fs.rmSync(SCRATCH_DIR, { recursive: true, force: true });
@@ -247,7 +284,7 @@ async function renewalLogin(seedText) {
     } catch {
         /* best effort */
     }
-    if (seedText) writeFileAtomic(path.join(SCRATCH_DIR, "persistent.json"), seedText);
+    if (seedText) writeFileAtomic(path.join(SCRATCH_DIR, "persistent.json"), stripMegaSession(seedText));
 
     const password = process.env.EUFY_GUEST_PASSWORD;
     const client = await makeClient({ password, persistentDir: SCRATCH_DIR });
@@ -333,6 +370,24 @@ async function main() {
         if (classification !== "usable") {
             console.error(`SESSION KEEPER: FAIL fresh login produced a ${classification} session — refusing to persist it`);
             process.exit(1);
+        }
+        // Regression guard (Oct 15, 2026): a renewal that leaves either
+        // token's expiry at/behind the seed's is not a renewal — refuse
+        // to persist it, so a silent half-renewal (the mega-skip bug)
+        // can never become the canonical copy unnoticed.
+        if (seed) {
+            const { shape: seedShape } = parseSessionCopy(seed);
+            if (seedShape.ok) {
+                const stale = [];
+                if (res.shape.legacyExpiryMs <= seedShape.legacyExpiryMs) stale.push("legacy");
+                if (res.shape.megaExpiryMs <= seedShape.megaExpiryMs) stale.push("mega");
+                if (stale.length > 0) {
+                    console.error(
+                        `SESSION KEEPER: FAIL renewal did not advance ${stale.join(" + ")} expiry — refusing to persist a half-renewed session`,
+                    );
+                    process.exit(1);
+                }
+            }
         }
         writeFileAtomic(PERSISTENT_FILE, res.freshText);
         await persistCanonical(res.freshText, res.shape, "keeper-login");
