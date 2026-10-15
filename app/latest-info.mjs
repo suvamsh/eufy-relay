@@ -107,6 +107,7 @@ export async function wakeLadderLatestInfo(askOnce, opts = {}) {
             if (!isTimeoutErr(e)) throw e;
             lastErr = e;
             let settle = attempt === 1 ? cfg.firstSettleMs : cfg.wakeSettleMs;
+            let nudgeJustEngaged = false;
             // v4.4: after the classic pair both time out, fire the wake
             // nudge once (a livestream start provably wakes the database
             // service), then ask again after only a short settle
@@ -120,14 +121,22 @@ export async function wakeLadderLatestInfo(askOnce, opts = {}) {
                 }
                 if (engaged) {
                     settle = cfg.nudgeSettleMs;
+                    nudgeJustEngaged = true;
                     log(`  ${label}: wake nudge engaged after 2 silent asks — settle ${cfg.nudgeSettleMs / 1000}s, asking again`);
                 } else {
                     log(`  ${label}: wake nudge did not engage after 2 silent asks — continuing the plain wake ladder`);
                 }
             }
-            // the classic pair (asks 1-2) always runs; the deadline only
-            // truncates the wake ladder beyond it
-            if (attempt >= 2 && now() + settle + timeoutFor(attempt + 1) > deadline) break;
+            // The classic pair (asks 1-2) always runs; the deadline only
+            // truncates the wake ladder beyond it. ONE exception: the ask
+            // immediately after an engaged nudge always runs — the nudge
+            // was already paid for, and breaking here (observed in
+            // verification runs 38694149443 / 38696440599, where two
+            // 480 s enumeration blocks had eaten the global budget
+            // before Backyard's turn) throws away the wake it bought.
+            // Cost is bounded: one settle + one ask (<= ~33 s), still
+            // inside the caller's hard process watchdog.
+            if (attempt >= 2 && !nudgeJustEngaged && now() + settle + timeoutFor(attempt + 1) > deadline) break;
             if (attempt === 1) {
                 log(`  ${label}: latest-info timed out — settle ${cfg.firstSettleMs / 1000}s, one retry`);
             } else if (!nudged || attempt > 2) {

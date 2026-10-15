@@ -191,4 +191,37 @@ function harness(script) {
     assert.equal(nudgeCalls, 0);
 }
 
+// --- v4.4: an engaged nudge guarantees its ask, even past the deadline -------
+// (verification runs 38694149443 / 38696440599 shape: the caller's budget
+// deadline had already passed when the nudge finished, and the ladder
+// broke before ask #3 — the nudge's wake was thrown away)
+{
+    const h = harness([{ type: "timeout" }, { type: "timeout" }, { type: "answer", latencyMs: 300 }]);
+    const t0 = h.opts.now();
+    const v = await wakeLadderLatestInfo(h.ask, {
+        ...h.opts,
+        deadlineMs: t0 + 100_000, // expires during the classic pair (~100s)
+        wakeNudge: async () => true,
+    });
+    assert.equal(v.length, 1, "post-nudge ask ran despite the passed deadline");
+    assert.deepEqual(h.asks, [45_000, 45_000, 30_000]);
+    assert.deepEqual(h.sleeps, [10_000, 3_000]);
+}
+
+// --- v4.4: the guarantee is ONE ask — the deadline binds again after it -------
+{
+    const h = harness([]);
+    const t0 = h.opts.now();
+    await assert.rejects(
+        () =>
+            wakeLadderLatestInfo(h.ask, {
+                ...h.opts,
+                deadlineMs: t0 + 100_000,
+                wakeNudge: async () => true,
+            }),
+        /timeout after/,
+    );
+    assert.equal(h.asks.length, 3, "exactly one guaranteed post-nudge ask, then the deadline breaks the ladder");
+}
+
 console.log("latest-info.test.mjs: all assertions passed");
