@@ -311,6 +311,18 @@ const heartbeat = {
     pushesSkipped: 0,
     bundlesWritten: 0,
     pushReregistrations: 0,
+    // Registration truth (Oct 15, 2026 push deep dive): the booleans of
+    // the three account-binding calls from the most recent (re)register
+    // round, plus the combined verdict in the client's own gate terms —
+    // (legacy && check) || mega. The MCS socket flag (pushConnected)
+    // alone once hid a dead binding behind a healthy heartbeat for 2 h.
+    pushRegisterLegacy: null,
+    pushRegisterCheck: null,
+    pushRegisterMega: null,
+    pushRegisterOk: null,
+    pushRegisteredAt: null,
+    pushRefusedRounds: 0, // consecutive rounds whose gate verdict was false
+    bootSessionUpdatedAt: null, // session-state.json updatedAt this link booted with
     lastEvent: null, // { device, stamp, at }
     sessionExpiresAt: null,
     sessionOk: true,
@@ -325,6 +337,22 @@ function writeHeartbeatFile() {
 async function syncHeartbeat(message) {
     writeHeartbeatFile();
     return syncData(message);
+}
+
+// Canonical-session fingerprint (Oct 15, 2026 push deep dive): the pair
+// of token expiries recorded in session/session-state.json. A fleet full
+// login (the session keeper's renewal) rewrites the canonical copy with
+// fresh expiries; a listener still running on the superseded copy can
+// never re-bind push — its register calls ride the dead session — so the
+// hold loop compares fingerprints and ends the link early when it moves.
+function readSessionFingerprint() {
+    try {
+        const s = JSON.parse(fs.readFileSync(path.join(DATA_DIR, "session", "session-state.json"), "utf8"));
+        if (!s.legacyExpiresAt && !s.megaExpiresAt) return null;
+        return { key: `${s.legacyExpiresAt}|${s.megaExpiresAt}`, updatedAt: s.updatedAt ?? null, source: s.source ?? null };
+    } catch {
+        return null;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -920,6 +948,7 @@ async function handlePush(m) {
  * routing to this live link. Invoked on a timer from the hold loop.
  */
 async function reregisterPush(reason) {
+    const roundStartMs = Date.now();
     try {
         const ps = client?.getPushService?.();
         if (!ps) return false;
@@ -943,7 +972,26 @@ async function reregisterPush(reason) {
                 heartbeat.pushReregistrations++;
                 heartbeat.pushConnected = true;
                 heartbeat.lastPushConnectedAt = new Date().toISOString();
-                log(`push re-register (${reason}): push reconnected — account routing re-bound to this link (total ${heartbeat.pushReregistrations})`);
+                // Round verdict (Oct 15, 2026 push deep dive, experiment
+                // E1): a round whose binding calls ran during this round
+                // and whose gate verdict is false means the account
+                // REFUSED this link's registration — the signature of a
+                // superseded session. E1 showed refused rounds never
+                // recover in place (3+ rounds, all false), so count them;
+                // the hold loop ends the link after 2 in a row.
+                const roundRan =
+                    heartbeat.pushRegisteredAt && Date.parse(heartbeat.pushRegisteredAt) >= roundStartMs - 5_000;
+                if (roundRan && heartbeat.pushRegisterOk === true) {
+                    heartbeat.pushRefusedRounds = 0;
+                } else if (roundRan && heartbeat.pushRegisterOk === false) {
+                    heartbeat.pushRefusedRounds++;
+                    log(
+                        `push re-register (${reason}): registration REFUSED by the account (refused rounds in a row: ${heartbeat.pushRefusedRounds})`,
+                    );
+                }
+                log(
+                    `push re-register (${reason}): push reconnected (total ${heartbeat.pushReregistrations}); binding ${heartbeat.pushRegisterOk ? "OK" : "NOT CONFIRMED — see the register lines above"}`,
+                );
                 return true;
             }
             await sleep(2_000);
@@ -995,6 +1043,12 @@ async function main() {
     heartbeat.sessionExpiresAt = new Date(legacyExpiryMs).toISOString();
     log(`session gate ok: legacy token expires ${heartbeat.sessionExpiresAt}`);
 
+    const bootSessionFingerprint = readSessionFingerprint();
+    if (bootSessionFingerprint) {
+        heartbeat.bootSessionUpdatedAt = bootSessionFingerprint.updatedAt;
+        log(`session fingerprint at boot: canonical updatedAt=${bootSessionFingerprint.updatedAt} source=${bootSessionFingerprint.source}`);
+    }
+
     const { EufySecurity } = await import(VENDOR_ENTRY);
     client = await EufySecurity.initialize({
         username: USERNAME,
@@ -1014,6 +1068,45 @@ async function main() {
     } catch {
         /* best-effort */
     }
+
+    // ---- registration instrumentation (Oct 15, 2026 push deep dive) -----
+    // On every MCS socket connect the vendored client makes three
+    // account-binding calls (legacy registerPushToken, legacy
+    // checkPushToken, mega registerMegaPushToken) and gates its
+    // "push connect" event on (legacy && check) || mega — but the
+    // results only ever reach the client's own logger, silenced here.
+    // The heartbeat's pushConnected is the raw socket flag, so a link
+    // whose binding died (its session superseded by a fleet full login —
+    // the Oct 15, 2026 deaf link) looked perfectly healthy for 2 h.
+    // Wrap the three methods so every round's results land in this log
+    // and in the heartbeat.
+    const wrapRegister = (obj, fn, field) => {
+        if (!obj || typeof obj[fn] !== "function") {
+            log(`push register instrumentation: ${fn} not found — binding results for it stay invisible`);
+            return;
+        }
+        const orig = obj[fn].bind(obj);
+        obj[fn] = async (...args) => {
+            let result;
+            try {
+                result = Boolean(await orig(...args));
+            } catch (e) {
+                log(`push register ${fn}: threw ${shortErr(e)}`);
+                result = false;
+            }
+            heartbeat[field] = result;
+            heartbeat.pushRegisteredAt = new Date().toISOString();
+            const { pushRegisterLegacy: l, pushRegisterCheck: c, pushRegisterMega: m } = heartbeat;
+            heartbeat.pushRegisterOk = (l === true && c === true) || m === true;
+            log(
+                `push register ${fn}: ${result} (round: legacy=${l} check=${c} mega=${m} -> binding ${heartbeat.pushRegisterOk ? "OK" : "NOT CONFIRMED"})`,
+            );
+            return result;
+        };
+    };
+    wrapRegister(client.api, "registerPushToken", "pushRegisterLegacy");
+    wrapRegister(client.api, "checkPushToken", "pushRegisterCheck");
+    if (client.megaTransition) wrapRegister(client.megaTransition, "registerMegaPushToken", "pushRegisterMega");
 
     const onChallenge = (kind) => {
         if (sessionFailed) return;
@@ -1095,10 +1188,54 @@ async function main() {
             log(
                 `heartbeat: pushConnected=${heartbeat.pushConnected} received=${heartbeat.pushesReceived} handled=${heartbeat.pushesHandled} skipped=${heartbeat.pushesSkipped} bundles=${heartbeat.bundlesWritten} rereg=${heartbeat.pushReregistrations}`,
             );
+            // Session-supersession check (Oct 15, 2026 push deep dive):
+            // syncData just merged origin/main, so session-state.json is
+            // current. If the keeper renewed the canonical session under
+            // this link, this link's push binding rides the dead session
+            // and no re-register can heal it — end early and chain a
+            // fresh link on the new session (same exit path as push-down).
+            const fp = readSessionFingerprint();
+            if (bootSessionFingerprint && fp && fp.key !== bootSessionFingerprint.key) {
+                heartbeat.state = "failed";
+                heartbeat.note = `session superseded (canonical renewed at ${fp.updatedAt ?? "unknown"}, source ${fp.source ?? "unknown"}) — link ended early, fresh link chained on the new session`;
+                log(
+                    "LISTENER SESSION SUPERSEDED: canonical session renewed under this link — ending early and chaining a fresh link on the new session",
+                );
+                await dispatchSuccessor("session superseded");
+                await syncHeartbeat(`listener link failed (session superseded) ${heartbeat.linkId}`);
+                try {
+                    client.close();
+                } catch {
+                    /* ignore */
+                }
+                process.exit(0);
+            }
         }
         if (Date.now() - lastReregister >= PUSH_REREGISTER_MS) {
             lastReregister = Date.now();
             await reregisterPush("periodic heal");
+            // Registration-refusal check (Oct 15, 2026 push deep dive,
+            // experiment E1): two consecutive rounds the account refused
+            // mean this link's session is dead for push and no in-place
+            // re-register will heal it — end early and chain a fresh link,
+            // which re-reads the current canonical session. Backstop for
+            // supersessions the fingerprint check cannot see (a login that
+            // never persisted a new canonical copy).
+            if (heartbeat.pushRefusedRounds >= 2) {
+                heartbeat.state = "failed";
+                heartbeat.note = `push registration refused ${heartbeat.pushRefusedRounds} rounds in a row — link ended early, fresh link chained`;
+                log(
+                    "LISTENER PUSH REGISTRATION REFUSED: account refused this link's binding twice in a row — ending early and chaining a fresh link",
+                );
+                await dispatchSuccessor("push registration refused");
+                await syncHeartbeat(`listener link failed (push registration refused) ${heartbeat.linkId}`);
+                try {
+                    client.close();
+                } catch {
+                    /* ignore */
+                }
+                process.exit(0);
+            }
         }
         if (pushDownSince !== null && Date.now() - pushDownSince > PUSH_DOWN_LIMIT_MS) {
             heartbeat.state = "failed";
