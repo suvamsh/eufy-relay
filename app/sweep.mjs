@@ -35,8 +35,10 @@
  * their own sections below.
  *
  * Battery discipline: one latest-info round per station per sweep (the
- * client also auto-queries latest-info on connect). Timeouts get ONE
- * retry — battery cameras routinely answer only on the second ask.
+ * client also auto-queries latest-info on connect). Timeouts get the
+ * v4.3 wake ladder (see latest-info.mjs): the classic retry, then
+ * further asks on the same connection while a cold camera's database
+ * service wakes — battery cameras routinely answer only on a later ask.
  *
  * V3 — BOUNDED PATH ENUMERATION (Experiment L, run 38358594501): the
  * SoloCam/indoor snapshot path is a pure function of the event's
@@ -74,6 +76,18 @@
  *     the same health record, so a dark alert can say whether the
  *     camera itself is alive-but-quiet, unreachable, or disabled.
  *
+ * V4.3 — WAKE LADDER FOR COLD CAMERA DATABASE SERVICES (Oct 15, 2026;
+ * probe runs 38692543287 / 38692568670 / Sideyard probe, RELAY-BUILD.md
+ * "Dark cameras"): a cold SoloCam's database service takes 100-220 s
+ * after a P2P connect before it answers latest-info; asks sent while
+ * cold are dropped. The classic 45+10+45 s window missed that wake
+ * time, so quiet battery cameras (Backyard/Sideyard always; Porch once
+ * its evening event traffic stops) failed sweep after sweep and went
+ * "dark" while verifiably alive. latest-info now goes through the
+ * wake ladder in latest-info.mjs: classic pair unchanged, then 30 s
+ * asks every 15 s until a 270 s wake window or the global-budget
+ * deadline. Warm stations are unaffected — they answer the first ask.
+ *
  * V4.1 — IMAGE-RESPONSE ATTRIBUTION HARDENING (Experiment R/R2): a
  * downloaded image is credited to a requested path ONLY when the
  * response event is from the same station AND its station-reported
@@ -107,6 +121,7 @@ import crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { parseEnumTemplate, buildEnumPath, shiftStamp, clusterWindowStamps } from "./enum-paths.mjs";
 import { ImageAttribution } from "./image-channel.mjs";
+import { wakeLadderLatestInfo, LATEST_FIRST_TIMEOUT_MS } from "./latest-info.mjs";
 import { deviceHealth, recordContactOk, recordContactFail, evaluateDark, shouldWriteMarker } from "./health.mjs";
 
 const USERNAME = process.env.EUFY_USERNAME || "";
@@ -128,8 +143,10 @@ const GLOBAL_STATION_BUDGET_MS = 20 * 60_000; // abort NEW station work after 20
 const HARD_WATCHDOG_MS = 28 * 60_000;
 const CONNECT_TIMEOUT_MS = 90_000;
 const CONNECT_SETTLE_MS = 20_000;
-const LATEST_TIMEOUT_MS = 45_000;
-const LATEST_SETTLE_MS = 10_000;
+// latest-info timings live in latest-info.mjs (the v4.3 wake ladder)
+// the wake ladder never runs past the global station budget minus this
+// reserve, so the remaining stations keep their classic window
+const LATEST_WAKE_BUDGET_RESERVE_MS = 60_000;
 const IMAGE_TIMEOUT_MS = 30_000;
 const STATION_GAP_MS = 5_000;
 // sweep v3 enumeration bounds (battery + run-budget protection)
@@ -500,13 +517,13 @@ class StationChannel {
         });
     }
 
-    async latestInfoOnce() {
+    async latestInfoOnce(timeoutMs = LATEST_FIRST_TIMEOUT_MS) {
         if (this.pendingLatest) throw new Error("a latest-info request is already outstanding");
         const p = new Promise((resolve, reject) => {
             const timer = setTimeout(() => {
                 this.pendingLatest = null;
-                reject(new Error(`timeout after ${LATEST_TIMEOUT_MS}ms waiting for latest-info`));
-            }, LATEST_TIMEOUT_MS);
+                reject(new Error(`timeout after ${timeoutMs}ms waiting for latest-info`));
+            }, timeoutMs);
             this.pendingLatest = { resolve, reject, timer };
         });
         try {
@@ -521,15 +538,15 @@ class StationChannel {
         return p;
     }
 
-    async latestInfo() {
-        try {
-            return await this.latestInfoOnce();
-        } catch (e) {
-            if (!isTimeoutErr(e)) throw e;
-            log(`  ${this.name}: latest-info timed out — settle ${LATEST_SETTLE_MS / 1000}s, one retry`);
-            await sleep(LATEST_SETTLE_MS);
-            return await this.latestInfoOnce();
-        }
+    async latestInfo(wakeDeadlineMs = Number.POSITIVE_INFINITY) {
+        // v4.3: the classic pair, then the wake ladder for cold SoloCam
+        // database services (see latest-info.mjs for the probe evidence)
+        return wakeLadderLatestInfo((timeoutMs) => this.latestInfoOnce(timeoutMs), {
+            deadlineMs: wakeDeadlineMs,
+            sleep,
+            log: (msg) => log(msg),
+            label: this.name,
+        });
     }
 
     async downloadImageOnce(filePath) {
@@ -1173,7 +1190,10 @@ async function sweepStation({ station, state, deviceBySerial, stationDevices = [
     const channel = new StationChannel(client, station);
     let latest;
     try {
-        latest = await channel.latestInfo();
+        // v4.3 wake ladder cap: the global station budget minus a reserve
+        // for the stations still to come (see latest-info.mjs)
+        const wakeDeadlineMs = t0 + GLOBAL_STATION_BUDGET_MS - LATEST_WAKE_BUDGET_RESERVE_MS;
+        latest = await channel.latestInfo(wakeDeadlineMs);
     } catch (e) {
         // v4.2 health: timeouts and other latest-info failures are failed contacts
         const kind = isTimeoutErr(e) ? "latest-info-timeout" : "latest-info-error";
